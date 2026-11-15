@@ -1,0 +1,40 @@
+{
+  "name": "Vitek8",
+  "port": 7777,
+  "notify": true,
+  "allow_different_levels": false,
+  "wait_for_partner_finish": true,
+  "reward_lock": true,
+  "no_pause": true,
+  "seed_choice": "host",
+  "lock_client_start": true,
+  "start_wait_max": 180,
+  "lawn_resync": 5.0,
+  "time_tolerance": 25,
+  "sync": {
+    "plants": true,
+    "sun": true,
+    "death": true,
+    "victory": true,
+    "level_start": true,
+    "cursor": true,
+    "slots": true,
+    "time": true
+  },
+  "overlay": {
+    "enabled": true,
+    "send_hz": 20,
+    "color": "#ffa500",
+    "show_name": true,
+    "fit": "auto",
+    "debug_self": false
+  },
+  "award_coin_types": [
+    8,
+    16
+  ],
+  "no_plant_sync_modes": [],
+  "lawnstrings_path": "",
+  "strings": {},
+  "debug": false
+}

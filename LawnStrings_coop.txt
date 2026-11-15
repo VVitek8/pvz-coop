@@ -1,0 +1,36 @@
+[COOP_TITLE]
+PvZ CO-OP
+
+[COOP_BTN_HOST]
+Host game
+
+[COOP_BTN_JOIN]
+Join game
+
+[COOP_BTN_KEEP]
+Keep
+
+[COOP_BTN_STOP]
+Stopd
+
+[COOP_BTN_CONNECT]
+Connect
+
+[COOP_BTN_NEXT]
+Next
+
+[COOP_BTN_OK]
+OK
+
+[COOP_BTN_RESYNC]
+Resync
+
+[COOP_BTN_DISCONNECT]
+Disconnect
+
+[COOP_BTN_RESTART]
+Start over
+
+[COOP_BTN_CANCEL]
+Cancel
+

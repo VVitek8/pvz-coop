@@ -1,0 +1,38 @@
+[COOP_TITLE]
+PvZ CO-OP
+
+[COOP_HOST]
+Host Game
+
+[COOP_JOIN]
+Join Game
+
+[COOP_KEEP]
+Keep
+
+[COOP_STOP]
+Stop
+
+[COOP_RESYNC]
+Resync
+
+[COOP_DISCONNECT]
+Disconnect
+
+[COOP_CONNECT]
+Connect
+
+[COOP_NEXT]
+Next
+
+[COOP_AGAIN]
+Start over
+
+[COOP_STOPWAIT]
+Stop waiting
+
+[COOP_OK]
+OK
+
+[COOP_CANCEL]
+Cancel

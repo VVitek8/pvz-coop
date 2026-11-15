@@ -1,0 +1,461 @@
+<?xml version="1.0" encoding="utf-8"?>
+<CheatTable CheatEngineTableVersion="42">
+  <CheatEntries>
+    <CheatEntry>
+      <ID>0</ID>
+      <Description>"COOP 00 CORE - shared buffer + routines (enable FIRST)"</Description>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>[ENABLE]
+// COOP 00 CORE v5 - shared buffer + routines. ENABLE THIS FIRST, DISABLE IT LAST.
+// Shared buffer: 00700600..00700FFF (if it collides with another mod: change this define() block AND COOP_BASE in pvz_coop.py)
+define(COOP_MODE,00700600)
+define(COOP_APPLYING,00700604)
+define(COOP_TICK,00700608)
+define(COOP_HEART,0070060C)
+define(COOP_MENUSHOW,0070061C)
+define(COOP_MENUDONE,00700620)
+define(COOP_MENURES,00700624)
+define(COOP_INMENU,00700628)
+define(COOP_IN_HEAD,00700638)
+define(COOP_IN_TAIL,0070063C)
+define(COOP_SAVEESP,0070064C)
+define(COOP_NOPAUSE,00700650)
+define(COOP_HOLD,00700654)
+define(COOP_HOLD_ZCD,00700658)
+define(COOP_HOLD_SUN,0070065C)
+define(COOP_QRES,00700660)
+define(COOP_LOSTRES,00700664)
+define(COOP_IN,00700880)
+define(COOP_TITLE,00700E80)
+define(COOP_PROMPT,00700EC0)
+define(COOP_BTN1,00700FC0)
+define(COOP_BTN2,00700FE0)
+
+alloc(coop_code,4096)
+label(coop_pump)
+label(pump_np_done)
+label(pump_hold_done)
+label(pump_actions)
+label(pump_loop)
+label(pump_ret)
+label(coop_menu_show)
+label(coop_apply_entry)
+label(ap_kill)
+label(kill_loop)
+label(kill_next)
+label(ap_add)
+label(ap_lost)
+label(lost_loop)
+label(lost_next)
+label(ap_lost_none)
+label(ap_lost_fail)
+label(ap_win)
+label(ap_pick)
+label(ap_unpick)
+label(ap_close)
+label(ap_q_bowl)
+label(ap_q_award)
+label(ap_q_cap)
+label(ap_done)
+registersymbol(coop_pump)
+registersymbol(coop_menu_show)
+registersymbol(coop_apply_entry)
+
+coop_code:
+
+// ---- coop_pump: once per game tick (called from inside pushad/popad of the pump hook, edi/ebp/esi are free here)
+coop_pump:
+mov eax,[006A9EC0]
+test eax,eax
+je pump_ret
+mov edi,[eax+00000768]
+test edi,edi
+je pump_ret
+mov eax,[edi+00005568]
+mov [COOP_TICK],eax
+add dword ptr [COOP_HEART],01
+// "no pause": Board+164 (paused flag) is forced to 0 every tick
+cmp dword ptr [COOP_NOPAUSE],00
+je pump_np_done
+mov byte ptr [edi+00000164],00
+pump_np_done:
+// "level start hold": the next-wave countdown (559C) and the falling-sun countdown (5538) are frozen at python's values
+cmp dword ptr [COOP_HOLD],00
+je pump_hold_done
+mov eax,[COOP_HOLD_ZCD]
+mov [edi+0000559C],eax
+mov eax,[COOP_HOLD_SUN]
+mov [edi+00005538],eax
+pump_hold_done:
+cmp dword ptr [COOP_INMENU],00
+jne pump_actions
+cmp dword ptr [COOP_MENUSHOW],01
+jne pump_actions
+call coop_menu_show
+jmp pump_ret
+pump_actions:
+cmp dword ptr [COOP_MODE],00
+je pump_ret
+cmp dword ptr [COOP_APPLYING],00
+jne pump_ret
+mov ebp,08
+pump_loop:
+mov eax,[COOP_IN_TAIL]
+cmp eax,[COOP_IN_HEAD]
+je pump_ret
+mov esi,eax
+shl esi,05
+add esi,COOP_IN
+sub esp,20
+mov edi,esp
+mov ecx,08
+cld
+rep movsd
+mov eax,[COOP_IN_TAIL]
+add eax,01
+and eax,1F
+mov [COOP_IN_TAIL],eax
+mov esi,esp
+mov dword ptr [COOP_APPLYING],01
+call coop_apply_entry
+mov dword ptr [COOP_APPLYING],00
+add esp,20
+sub ebp,01
+jne pump_loop
+pump_ret:
+ret
+
+// ---- coop_menu_show: modal in-game dialog, texts are written by python into COOP_TITLE/PROMPT/BTN1/BTN2
+coop_menu_show:
+mov dword ptr [COOP_INMENU],01
+mov dword ptr [COOP_MENUSHOW],00
+mov dword ptr [COOP_MENUDONE],00
+push 02
+push COOP_BTN2
+push COOP_BTN1
+push COOP_PROMPT
+push COOP_TITLE
+push 01
+push dword ptr [006A9EC0]
+call 004504B0
+mov [COOP_MENURES],eax
+mov dword ptr [COOP_MENUDONE],01
+mov dword ptr [COOP_INMENU],00
+ret
+
+// ---- coop_apply_entry: esi = entry (8 dwords: type,tick,row,col,p1,p2,v1,v2)
+//  02 remove plant (row,col,p1=type)        05 add plant (row,col,p1=type,p2=imitater or -1)
+//  06 zombies won (friend lost, a living zombie is passed)             07 fade out level (friend won)
+//  08 seed chooser: pick p1                 09 seed chooser: put p1 back     0A seed chooser: close (start level)
+//  0B query IsWallnutBowlingLevel           0C query HasLevelAwardDropped    0D query GetNumSeedsInBank   (result -&gt; COOP_QRES)
+// Stack is restored from COOP_SAVEESP at the end, whatever the callee's calling convention does.
+coop_apply_entry:
+pushad
+mov [COOP_SAVEESP],esp
+mov ebp,[006A9EC0]
+test ebp,ebp
+je ap_done
+mov edi,[ebp+00000768]
+mov eax,[esi]
+cmp eax,02
+je ap_kill
+cmp eax,05
+je ap_add
+cmp eax,06
+je ap_lost
+cmp eax,07
+je ap_win
+cmp eax,08
+je ap_pick
+cmp eax,09
+je ap_unpick
+cmp eax,0A
+je ap_close
+cmp eax,0B
+je ap_q_bowl
+cmp eax,0C
+je ap_q_award
+cmp eax,0D
+je ap_q_cap
+jmp ap_done
+
+ap_add:
+test edi,edi
+je ap_done
+push dword ptr [esi+14]
+push dword ptr [esi+10]
+push dword ptr [esi+0C]
+push edi
+mov eax,[esi+08]
+call 0040D120
+jmp ap_done
+
+ap_kill:
+test edi,edi
+je ap_done
+mov ebx,[edi+000000AC]
+mov ecx,[edi+000000B0]
+imul ecx,ecx,0000014C
+add ecx,ebx
+kill_loop:
+cmp ebx,ecx
+jae ap_done
+cmp [ebx+04],edi
+jne kill_next
+cmp byte ptr [ebx+00000141],00
+jne kill_next
+cmp byte ptr [ebx+00000142],00
+jne kill_next
+mov eax,[ebx+1C]
+cmp eax,[esi+08]
+jne kill_next
+mov eax,[ebx+28]
+cmp eax,[esi+0C]
+jne kill_next
+mov eax,[ebx+24]
+cmp eax,[esi+10]
+jne kill_next
+push ebx
+call 004679B0
+jmp ap_done
+kill_next:
+add ebx,0000014C
+jmp kill_loop
+
+// ZombiesWon needs a REAL zombie (0 is only valid on a few special levels and crashes in the attachment code otherwise):
+// take the first living zombie of the board (put at the house); if there is none, one is created for it.
+ap_lost:
+test edi,edi
+je ap_done
+mov ebx,[edi+00000090]
+mov ecx,[edi+00000094]
+imul ecx,ecx,0000015C
+add ecx,ebx
+lost_loop:
+cmp ebx,ecx
+jae ap_lost_none
+cmp [ebx+04],edi
+jne lost_next
+cmp byte ptr [ebx+000000EC],00
+jne lost_next
+mov dword ptr [ebx+0000002C],0C1200000
+push ebx
+push edi
+call 00413400
+mov dword ptr [COOP_LOSTRES],01
+jmp ap_done
+lost_next:
+add ebx,0000015C
+jmp lost_loop
+ap_lost_none:
+// no living zombie on this board: make one (AddZombieInRow: ebx=fromWave 0, row 2, type 0 -&gt; eax = Zombie*) and use it
+mov ebx,00000000
+push 02
+push 00
+mov eax,edi
+call 0040DDC0
+test eax,eax
+je ap_lost_fail
+mov dword ptr [eax+0000002C],0C1200000
+push eax
+push edi
+call 00413400
+mov dword ptr [COOP_LOSTRES],02
+jmp ap_done
+ap_lost_fail:
+mov dword ptr [COOP_LOSTRES],00
+jmp ap_done
+
+ap_win:
+test edi,edi
+je ap_done
+mov ecx,edi
+call 0040C3E0
+jmp ap_done
+
+ap_pick:
+mov eax,[esi+10]
+cmp eax,30
+ja ap_done
+mov ebx,eax
+mov edi,ebp
+call 00453B20
+test al,al
+je ap_done
+mov ecx,[ebp+00000774]
+test ecx,ecx
+je ap_done
+mov eax,ebx
+imul eax,eax,0000003C
+lea edx,[ecx+eax+000000A4]
+cmp [edx+20],ebx
+jne ap_done
+cmp dword ptr [edx+24],03
+jne ap_done
+push edx
+mov eax,ecx
+call 00486030
+jmp ap_done
+
+ap_unpick:
+mov eax,[esi+10]
+cmp eax,30
+ja ap_done
+mov ebx,eax
+mov ecx,[ebp+00000774]
+test ecx,ecx
+je ap_done
+imul eax,eax,0000003C
+lea edx,[ecx+eax+000000A4]
+cmp [edx+20],ebx
+jne ap_done
+cmp dword ptr [edx+24],01
+jne ap_done
+push edx
+mov eax,ecx
+call 00485E90
+jmp ap_done
+
+ap_close:
+mov ebx,[ebp+00000774]
+test ebx,ebx
+je ap_done
+call 00486D20
+jmp ap_done
+
+ap_q_bowl:
+mov ecx,ebp
+call 00453840
+movzx eax,al
+mov [COOP_QRES],eax
+jmp ap_done
+
+ap_q_award:
+test edi,edi
+je ap_done
+mov eax,edi
+call 00413A40
+movzx eax,al
+mov [COOP_QRES],eax
+jmp ap_done
+
+ap_q_cap:
+test edi,edi
+je ap_done
+call 0041BEE0
+mov [COOP_QRES],eax
+jmp ap_done
+
+ap_done:
+mov esp,[COOP_SAVEESP]
+popad
+ret
+
+[DISABLE]
+// code block is intentionally NOT deallocated: the pump hook may still be calling it (disable the pump first, then this one)
+unregistersymbol(coop_pump)
+unregistersymbol(coop_menu_show)
+unregistersymbol(coop_apply_entry)
+00700600:
+dd 00000000
+00700650:
+dd 00000000
+dd 00000000</AssemblerScript>
+    </CheatEntry>
+    <CheatEntry>
+      <ID>1</ID>
+      <Description>"COOP 01A PUMP - Board::Update 415D40 (use 01A OR 01B)"</Description>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>[ENABLE]
+// COOP 01A PUMP (Board::Update 415D40): once per game tick applies actions from the other player,
+// shows the F6 menu, keeps the game un-paused (if enabled in coop_config.json) and holds the level start.
+// Use EITHER 01A or 01B. If another mod already hooks 415D40 (button_select_seeds_again) use 01B.
+alloc(newmem,2048)
+label(returnhere)
+label(originalcode)
+label(exit)
+
+newmem:
+pushad
+call coop_pump
+popad
+
+originalcode:
+push -01
+push 0064FA35
+
+exit:
+jmp returnhere
+
+00415D40:
+jmp newmem
+nop 2
+returnhere:
+
+[DISABLE]
+dealloc(newmem)
+00415D40:
+db 6A FF 68 35 FA 64 00
+//push -01
+//push 0064FA35</AssemblerScript>
+    </CheatEntry>
+    <CheatEntry>
+      <ID>2</ID>
+      <Description>"COOP 01B PUMP - Board::Update 415DF0 (use 01A OR 01B)"</Description>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>[ENABLE]
+// COOP 01B PUMP (Board::Update 415DF0, ebp = Board): alternative site, directly on the "is the game paused?" check.
+// Use EITHER 01A or 01B.
+alloc(newmem,2048)
+label(returnhere)
+label(originalcode)
+label(exit)
+
+newmem:
+pushad
+call coop_pump
+popad
+
+originalcode:
+cmp byte ptr [ebp+00000164],00
+
+exit:
+jmp returnhere
+
+00415DF0:
+jmp newmem
+nop 2
+returnhere:
+
+[DISABLE]
+dealloc(newmem)
+00415DF0:
+db 80 BD 64 01 00 00 00
+//cmp byte ptr [ebp+00000164],00</AssemblerScript>
+    </CheatEntry>
+    <CheatEntry>
+      <ID>3</ID>
+      <Description>"COOP 02 NO-PAUSE - CanPauseNow 44F410 (optional)"</Description>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>[ENABLE]
+// COOP 02 NO-PAUSE (optional): LawnApp::CanPauseNow (44F410) always answers "cannot".
+// Esc/Space/losing the window focus then no longer open the pause screen (and the second game window on the same PC no longer freezes).
+// The original bytes are read from the game when the script is enabled and written back by [DISABLE].
+alloc(coop_np_saved,16)
+registersymbol(coop_np_saved)
+
+coop_np_saved:
+readmem(0044F410,3)
+
+0044F410:
+db 31 C0 C3
+
+[DISABLE]
+0044F410:
+readmem(coop_np_saved,3)
+unregistersymbol(coop_np_saved)
+dealloc(coop_np_saved)</AssemblerScript>
+    </CheatEntry>
+  </CheatEntries>
+  <UserdefinedSymbols/>
+</CheatTable>
