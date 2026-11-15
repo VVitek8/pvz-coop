@@ -11,7 +11,7 @@ Join game
 Keep
 
 [COOP_BTN_STOP]
-Stopd
+Stop
 
 [COOP_BTN_CONNECT]
 Connect
