@@ -26,11 +26,13 @@ import struct
 import sys
 import threading
 import time
+import zlib
 
 # ------------------------------------------------------------------ shared buffer layout (must match the CT)
 COOP_BASE = 0x00700600
 OFF = dict(MODE=0x00, APPLYING=0x04, TICK=0x08, HEART=0x0C, MENUSHOW=0x1C, MENUDONE=0x20, MENURES=0x24, INMENU=0x28,
            IN_HEAD=0x38, IN_TAIL=0x3C, SAVEESP=0x4C, NOPAUSE=0x50, HOLD=0x54, HOLD_ZCD=0x58, HOLD_SUN=0x5C, QRES=0x60,
+           ZRES=0x68, ZHOLD=0x6C, ZHOLD_VAL=0x70, CRES=0x74,
            IN=0x280, TITLE=0x880, PROMPT=0x8C0, BTN1=0x9C0, BTN2=0x9E0)
 BUF_SIZE = 0xA00
 IN_N = 32
@@ -38,6 +40,7 @@ ENTRY = struct.Struct('<8i')        # type, tick, row, col, p1, p2, v1, v2
 # entries the game-side code knows
 A_KILL_PLANT, A_ADD_PLANT, A_LOST, A_WIN = 2, 5, 6, 7
 A_SEED_PICK, A_SEED_UNPICK, A_SEED_CLOSE = 8, 9, 10
+A_ADD_ZOMBIE, A_ADD_COIN, A_COLLECT = 0x0E, 0x0F, 0x10
 Q_BOWL, Q_AWARD, Q_CAP = 0x0B, 0x0C, 0x0D       # queries: the answer appears in QRES
 QNONE = 0xFFFFFFFF
 
@@ -50,6 +53,18 @@ PVZ_BASE, BOARD_OFF = 0x6A9EC0, 0x768
 APP_MODE, APP_SCENE, APP_CHOOSER, APP_WM = 0x7F8, 0x7FC, 0x774, 0x320
 WM_MOUSE_X, WM_MOUSE_Y = 0xE0, 0xE4
 B_PLANT, B_PLANT_MAX, P_SIZE = 0xAC, 0xB0, 0x14C
+P_HP = 0x40
+B_ZOMBIES, B_ZOMBIES_MAX, Z_SIZE = 0x90, 0x94, 0x15C                           # zombie array of the board
+Z_ROW, Z_TYPE, Z_X, Z_Y = 0x1C, 0x24, 0x2C, 0x30
+Z_SLOW, Z_BUTTER, Z_FREEZE, Z_CHARM = 0xAC, 0xB0, 0xB4, 0xB8
+Z_HP, Z_HP1, Z_HP2, Z_BALLOON, Z_DEAD, Z_ID = 0xC8, 0xD0, 0xDC, 0xE4, 0xEC, 0x158
+Z_VID = 0x134                                                                  # variant id many mods keep here
+# byte ranges of the zombie struct that are copied from the host (numbers only: no pointers, no object ids, no animation ids)
+Z_COPY = [(0x1C, 0x24), (0x28, 0x7C), (0x84, 0xEC), (0xF0 + 0x10, 0x110), (0x11C, 0x128), (0x130, 0x134), (0x138, 0x140), (0x148, 0x14C)]
+Z_COPY_IDENT = [(0x24, 0x28), (0x134, 0x138)]                                  # type + variant id: copied only when both sides produced the same kind
+B_PROGRESS = 0x5610                                                            # level progress bar
+C_W = 0x10                                                                     # item width/height (GameObject): the mouse hit area
+C_CARD = 0x68                                                                  # plant type of a seed-packet item
 B_CURSOR, B_LEVEL, B_SUN = 0x138, 0x5550, 0x5560
 CUR_SLOT, CUR_SEED, CUR_IMI, CUR_TYPE = 0x24, 0x28, 0x2C, 0x30
 CH_SEEDS, CH_STRIDE, CH_TYPE, CH_STATE, CH_START_BTN, N_SEEDS = 0xA4, 0x3C, 0x20, 0x24, 0x88, 49
@@ -73,9 +88,10 @@ PLANT_NAMES = ['Peashooter', 'Sunflower', 'Cherry Bomb', 'Wall-nut', 'Potato Min
                'Gold Magnet', 'Spikerock', 'Cob Cannon', 'Imitater']
 
 # ------------------------------------------------------------------ network protocol
-PROTO_VER = 5
+PROTO_VER = 6
 K_HELLO, K_ADD, K_REMOVE, K_SUN, K_SETSUN, K_PLANTS, K_REQ = 1, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15
-K_STATE, K_CURSOR, K_SEEDS, K_SEEDREQ, K_SLOTS, K_SLOTUSE = 0x20, 0x21, 0x22, 0x23, 0x24, 0x25
+K_STATE, K_CURSOR, K_SEEDS, K_SEEDREQ, K_SLOTS, K_SLOTUSE, K_PHP, K_ZOMBIES = 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27
+K_WAVE, K_AWARD, K_COLLECT = 0x28, 0x29, 0x2A
 K_LOSE, K_WIN = 0x30, 0x31
 K_PING, K_PONG, K_BYE = 0x40, 0x41, 0x50
 FRAME = struct.Struct('<HB')
@@ -86,6 +102,9 @@ P_INT = struct.Struct('<i')         # sun delta / absolute sun
 P_CNT = struct.Struct('<H')
 P_STATE = struct.Struct('<bhhBBih')  # scene, mode, level, done, inboard, board tick, ms per tick
 P_SLOTUSE = struct.Struct('<BhhH')   # slot index, seed type, imitater, recharge time
+P_PHP = struct.Struct('<hhhi')       # row, col, type, plant health (host -> client)
+P_WID = struct.Struct('<I')            # zombie id on the host, followed by the zombie's whole struct
+P_AWARD = struct.Struct('<hhhhh')    # item type, x, y, plant type (seed packet), motion
 P_CURSOR = struct.Struct('<hhhhhh') # x, y, seed, imitater, cursor type, seed slot index
 P_SEEDREQ = struct.Struct('<BB')    # seed, want(0/1)
 
@@ -103,7 +122,17 @@ DEFAULTS = {
     'allow_different_levels': False,     # True: the friends may play different levels (nothing is shared then)
     'wait_for_partner_finish': True,     # client only (everybody waits for the host): finished first on a different level -> wait
     'reward_lock': True,                 # nobody can pick up the level reward until BOTH have finished (same level)
-    'lawn_resync': 5.0,                  # seconds: the host re-sends its lawn so both lawns stay identical (0 = off)
+    'reward_wait_max': 600,              # seconds the reward may stay locked (0 = forever)
+    'lawn_resync': 3.0,                  # seconds: the host re-sends its lawn so both lawns stay identical (0 = off)
+    'sun_resync': 1.0,                   # seconds: the host re-sends its sun amount (the host's wallet is the truth, 0 = off)
+    'hp_resync': 0.25,                   # seconds: the host re-sends the health of its plants (0 = off)
+    'zombie_resync': 0.033,              # seconds: the host re-sends ALL its zombies (whole struct, compressed) ~30 times a second
+    'zombie_orphan_grace': 0.8,          # seconds a zombie the host does not have may live on the client before it is removed
+    'zombie_gone_delay': 0.5,            # seconds: a zombie that died only here (the host still has it) is brought back after this
+    'zombie_create_burst': 4,            # how many zombies the client creates at once (mods that pick variants at random need several tries)
+    'zombie_create_tries': 12,           # tries to get the host's variant before the client shows a plain one
+    'variant_base': {},                  # {"400": 0}: vanilla zombie type used to create a mod type (default 0 = regular zombie)
+    'reward_lock_mode': 'hitbox',        # hitbox: the reward stays visible but cannot be clicked | hide: it is moved off screen while locked
     'time_tolerance': 25,                # game ticks of drift allowed before the client speeds up / slows down     # finished first on different levels -> wait until the friend finishes his level
     'no_pause': True,                    # the game keeps running while a pause/menu window is open (also needs script 02 for Esc/focus loss)
     'seed_choice': 'host',               # "host": only the host picks seeds | "both": either may pick | "off": everybody picks alone
@@ -115,14 +144,18 @@ DEFAULTS = {
         'death': True,                   # zombies reached the house for one -> for both
         'victory': True,                 # level completed for one -> completed for both
         'level_start': True,             # the CLIENT's first wave waits until the host is playing (the host never waits)
+        'plant_hp': True,                # plant health follows the host
+        'waves': True,                   # the client's progress bar follows the host's
+        'reward_mirror': True,           # zombie mirror: the reward is created on the client too; whoever picks it up, the other picks his up as well
+        'zombies': False,                # EXPERIMENTAL: the client shows the HOST's zombies (spawn, position, health, armor, death); own waves are off. Turn on at both
         'slots': True,                   # same seed slots (content) + recharge starts on both sides
         'time': True,                    # the client follows the host's game speed and clock
         'cursor': True,                  # see the friend's mouse and the plant in his hand
     },
-    'overlay': {'enabled': True, 'send_hz': 20, 'color': '#ffa500', 'show_name': True,
+    'overlay': {'enabled': True, 'send_hz': 20, 'color': '#ffa500', 'show_name': True, 'toasts': False,
                 'fit': 'auto',            # auto: calibrated from your own mouse | letterbox | stretch (how 800x600 sits in the window)
                 'debug_self': False},     # draws a green cross where YOUR mouse is: shows if the mapping is right
-    'award_coin_types': [8, 16],         # item types treated as the level reward (8 trophy, 16 plant card)
+    'award_coin_types': list(range(8, 28)),  # item types treated as the level reward (8 trophy, 9 shovel ... 16 plant card ... 27)
     'no_plant_sync_modes': [],           # extra GameMode ids where plants are never synced (bowling is detected by the game itself)
     'strings': {},                       # override any text of the in-game menus, see CONFIG.md
     'lawnstrings_path': '',              # full path to LawnStrings.txt if it is not found automatically
@@ -435,6 +468,10 @@ class Coop:
         self._was_same = False
         self.prev_scene = None
         self.ls_keys = None
+        if self.cfg['seed_choice'] == 'both':
+            self.log('[coop] seed_choice "both" is gone: the HOST chooses the seeds, the others follow')
+            self.cfg['seed_choice'] = 'host'
+        self.last_tick = None
         self.reset_tracking()
 
     # ---- helpers
@@ -507,13 +544,46 @@ class Coop:
         self.born = {}
         self.start_locked = False
         self.late_t = 0.0
+        self.close_sent_t = None
+        self.close_tries = 0
+        self.seed_req_t = 0.0
         self._slot_t = 0.0
         self.slot_sent = None
         self.slot_prev = None
         self.slot_applied = False
         self.hidden = {}
         self.interval_orig = None
+        self.zhold_on = False
+        self.zhold_orig = None
+        self.zmap = {}               # host zombie key -> my zombie address
+        self.zhost = None            # (time, [entries]) last snapshot from the host
+        self.zcreating = None        # (host key, since) a creation is in flight
+        self.zseen = {}              # my zombie address -> first time seen unmapped
+        self._zombie_t = 0.0
+        self.zwin_sent = False
+        self.zbatch = None           # (since, addresses before, host ids wanted)
+        self.ztries = {}
+        self.zfallback = set()       # host ids shown as a plain zombie (variant not available here)
+        self.zunsup = set()
+        self.zgone = {}
+        self.zfix = 0
+        self.zdiff_since = None
+        self._zdiff_log = 0.0
+        self.zwas_playing = False
+        self._zsend_t = 0.0
+        self._wave_t = 0.0
+        self.award_known = {}
+        self.coin_pending = None
+        self.collect_echo_until = 0.0
         self._lawn_t = 0.0
+        self._sun_t = 0.0
+        self._hp_t = 0.0
+        self._coin_t = 0.0
+        self.sun_changed_t = 0.0
+        self.lock_since = None
+        self.lock_given_up = False
+        self.last_tick = None
+        self.ignore_coins = None
 
     # ---- shared buffer helpers
     def rd(self, k): return self.mem.u32(COOP_BASE + OFF[k])
@@ -525,7 +595,7 @@ class Coop:
         if any(raw[0x80:0xA00]) and self.rd('MODE') == 0 and self.rd('HEART') == 0:
             self.log('[coop] WARNING: shared buffer %08X is not empty - another script may use it. '
                      'Change COOP_BASE / the define() block if the game misbehaves.' % COOP_BASE)
-        for k in ('IN_HEAD', 'IN_TAIL', 'MENUSHOW', 'MENUDONE', 'HOLD'):
+        for k in ('IN_HEAD', 'IN_TAIL', 'MENUSHOW', 'MENUDONE', 'HOLD', 'ZHOLD', 'ZRES', 'CRES'):
             self.wr(k, 0)
         self.wr('NOPAUSE', 1 if self.cfg['no_pause'] else 0)
         self.wr('QRES', QNONE)
@@ -738,6 +808,8 @@ class Coop:
 
     def _lost(self):
         self.restore_interval()
+        if self.zhold_on:
+            self.set_zhold(False, self.board())
         self.link = None
         self.role = MODE_OFF
         self.peer = None
@@ -805,7 +877,17 @@ class Coop:
             self.peer_cursor = P_CURSOR.unpack(payload) + (time.time(),)
             if self.peer_cursor[2] >= 0 and (old is None or old[2] != self.peer_cursor[2]):
                 nm = PLANT_NAMES[self.peer_cursor[2]] if self.peer_cursor[2] < len(PLANT_NAMES) else 'a plant'
-                self.add_toast('%s took %s' % (self.peer_name, nm))
+                self.add_toast('%s took %s' % (self.peer_name, nm))                 # shown only if overlay.toasts is on
+        elif kind == K_PHP:
+            self.remote_php(payload)
+        elif kind == K_ZOMBIES:
+            self.remote_zombies(payload)
+        elif kind == K_WAVE:
+            self.remote_wave(payload)
+        elif kind == K_AWARD:
+            self.remote_award(*P_AWARD.unpack(payload))
+        elif kind == K_COLLECT:
+            self.remote_collect()
         elif kind == K_SLOTS:
             self.remote_slots(payload)
         elif kind == K_SLOTUSE:
@@ -878,6 +960,8 @@ class Coop:
         b = self.board()
         if not b or not self.sun_enabled():
             return
+        if time.time() - self.sun_changed_t < 0.4:
+            return                                              # I just spent/collected: the host will confirm with its next value
         self.mem.w32(b + B_SUN, max(0, v))
         self.sun_prev = max(0, v)
 
@@ -899,6 +983,248 @@ class Coop:
         for key in mine - host:
             if now - self.born.get(key, 0.0) > 2.0:              # not a plant I planted a moment ago (host does not know it yet)
                 self.remote_remove(*key)
+
+    def plant_hp_list(self, b):
+        """[(row, col, type, hp)] of my living plants"""
+        arr, mx = self.mem.u32(b + B_PLANT), self.mem.u32(b + B_PLANT_MAX)
+        if not arr or mx == 0 or mx > 2048:
+            return []
+        raw = self.mem.read(arr, mx * P_SIZE)
+        res = []
+        for i in range(mx):
+            o = i * P_SIZE
+            if struct.unpack_from('<I', raw, o + 4)[0] != b or raw[o + 0x141] or raw[o + 0x142]:
+                continue
+            res.append((arr + o, struct.unpack_from('<i', raw, o + 0x1C)[0], struct.unpack_from('<i', raw, o + 0x28)[0],
+                        struct.unpack_from('<i', raw, o + 0x24)[0], struct.unpack_from('<i', raw, o + P_HP)[0]))
+        return res
+
+    def send_plant_hp(self, b):
+        lst = [(r, c, t, hp) for _, r, c, t, hp in self.plant_hp_list(b) if hp > 0][:200]
+        if lst:
+            self.link.send(K_PHP, P_CNT.pack(len(lst)) + b''.join(P_PHP.pack(*e) for e in lst))
+
+    def remote_php(self, payload):
+        """the host's plant health is the truth"""
+        b = self.board()
+        if self.role != MODE_CLIENT or not b or not self.sy('plant_hp') or not self.plants_enabled():
+            return
+        n = P_CNT.unpack_from(payload, 0)[0]
+        host = {}
+        for k in range(n):
+            r, c, t, hp = P_PHP.unpack_from(payload, P_CNT.size + k * P_PHP.size)
+            host[(r, c, t)] = hp
+        for addr, r, c, t, hp in self.plant_hp_list(b):
+            want = host.get((r, c, t))
+            if want and 0 < want <= 60000 and want != hp:
+                self.mem.w32(addr + P_HP, want)
+
+    # ---- zombie mirror (EXPERIMENTAL): the HOST's zombies are the truth, the client only shows them
+    def read_zombies(self, b):
+        """every living zombie of the board, with its whole struct ('raw')"""
+        arr, mx = self.mem.u32(b + B_ZOMBIES), self.mem.u32(b + B_ZOMBIES_MAX)
+        if not arr or mx == 0 or mx > 1024:
+            return []
+        raw = self.mem.read(arr, mx * Z_SIZE)
+        res = []
+        for i in range(mx):
+            o = i * Z_SIZE
+            if struct.unpack_from('<I', raw, o + 4)[0] != b or raw[o + Z_DEAD]:
+                continue
+            zr = bytes(raw[o:o + Z_SIZE])
+            zid = struct.unpack_from('<I', zr, Z_ID)[0]
+            res.append(dict(addr=arr + o, wid=(zid ^ (i << 24)) & 0xFFFFFFFF, raw=zr,
+                            type=struct.unpack_from('<i', zr, Z_TYPE)[0], row=struct.unpack_from('<i', zr, Z_ROW)[0],
+                            sig=(struct.unpack_from('<i', zr, Z_TYPE)[0], struct.unpack_from('<I', zr, Z_VID)[0])))
+        return res
+
+    def send_zombies(self, b):
+        zs = [z for z in self.read_zombies(b) if 0 <= z['type'] < 0x400 and 0 <= z['row'] < 8][:300]
+        body = P_CNT.pack(len(zs)) + b''.join(P_WID.pack(z['wid']) + z['raw'] for z in zs)
+        self.link.send(K_ZOMBIES, zlib.compress(body, 1))
+
+    def remote_zombies(self, payload):
+        if self.role != MODE_CLIENT or not self.sy('zombies'):
+            return
+        body = zlib.decompress(payload)
+        n = P_CNT.unpack_from(body, 0)[0]
+        ents, step = {}, P_WID.size + Z_SIZE
+        for k in range(n):
+            o = P_CNT.size + k * step
+            wid = P_WID.unpack_from(body, o)[0]
+            zr = bytes(body[o + 4:o + step])
+            ents[wid] = dict(wid=wid, raw=zr, type=struct.unpack_from('<i', zr, Z_TYPE)[0], row=struct.unpack_from('<i', zr, Z_ROW)[0],
+                             sig=(struct.unpack_from('<i', zr, Z_TYPE)[0], struct.unpack_from('<I', zr, Z_VID)[0]))
+        self.zhost = (time.time(), ents)
+
+    def remote_wave(self, payload):
+        b = self.board()
+        if self.role == MODE_CLIENT and b and self.sy('waves') and self.zmirror_active() and len(payload) == 4:
+            self.mem.write(b + B_PROGRESS, payload)             # the level progress bar shows the HOST's progress
+
+    def zmirror_active(self):
+        p = self.peer
+        return bool(self.sy('zombies') and self.role == MODE_CLIENT and self.same_level() and self.local['scene'] == SC_PLAYING
+                    and p and p['scene'] == SC_PLAYING)
+
+    def set_zhold(self, on, b):
+        """client: the game must not spawn zombies by itself (the wave countdown is kept high)"""
+        if on and not self.zhold_on:
+            try:
+                self.zhold_orig = self.mem.u32(b + B_ZCD)
+                self.wr('ZHOLD_VAL', 30000)
+                self.wr('ZHOLD', 1)
+                self.zhold_on = True
+                self.log('[coop] zombie mirror ON: my own waves are off, the host\'s zombies are shown')
+            except Exception as e:
+                self.log('[coop] zombie hold failed: %r' % (e,))
+        elif not on and self.zhold_on:
+            self.wr('ZHOLD', 0)
+            self.zhold_on = False
+            if b and self.zhold_orig is not None:
+                try:
+                    self.mem.w32(b + B_ZCD, self.zhold_orig)
+                except Exception:
+                    pass
+            self.zhold_orig = None
+
+    def release_zhold_raw(self):
+        try:
+            self.wr('ZHOLD', 0)                                  # a stale zombie hold would stop the next level's waves
+        except Exception:
+            pass
+        self.zhold_on = False
+        self.zhold_orig = None
+
+    def kill_zombie(self, addr):
+        self.mem.write(addr + Z_DEAD, b'\x01')                       # "disappears": removed on the next update
+
+    def zombie_base_type(self, sig):
+        t = sig[0]
+        if 0 <= t < 0x30:
+            return t
+        return int(self.cfg['variant_base'].get(str(t), 0))     # a mod's own type: made from a vanilla one, the mod turns it into the variant
+
+    def apply_zombie(self, a, local_raw, host_raw, ident):
+        ranges = Z_COPY + (Z_COPY_IDENT if ident else [])
+        for lo, hi in ranges:
+            if local_raw[lo:hi] != host_raw[lo:hi]:
+                self.mem.write(a + lo, host_raw[lo:hi])
+
+    def poll_zombies(self, now, b):
+        if not (self.sy('zombies') and self.role == MODE_CLIENT):
+            if self.zhold_on:
+                self.set_zhold(False, b)
+            return
+        p = self.peer
+        # the host's level is over (award screen / left the level) while mine is still running: end it too
+        if p and self.local['scene'] == SC_PLAYING:
+            same_key = bool(p['inboard'] and p['key'] == self.local['key'])
+            if same_key and p['scene'] == SC_PLAYING:
+                self.zwas_playing = True
+            elif self.zwas_playing and not self.zwin_sent and (p['scene'] == SC_AWARD or not same_key):
+                self.zwin_sent = True
+                self.log('[coop] the host left / finished the level -> it ends here too')
+                self.queue_in((A_WIN, 0, 0, 0, 0, 0, 0, 0))
+        if not self.zmirror_active():
+            self.set_zhold(False, b)
+            return
+        self.set_zhold(True, b)
+        if now - self._zombie_t < 0.02:
+            return
+        self._zombie_t = now
+        try:
+            mine = {z['addr']: z for z in self.read_zombies(b)}
+        except Exception as e:
+            self.dbg('zombies: %r' % (e,))
+            return
+        snap = self.zhost
+        fresh = bool(snap and now - snap[0] < 1.0)
+        host = snap[1] if fresh else {}
+        # 1) mappings: a zombie that died only here is given a moment, then it is brought back
+        for wid, a in list(self.zmap.items()):
+            if a in mine:
+                self.zgone.pop(wid, None)
+            elif wid in host:
+                if now - self.zgone.setdefault(wid, now) >= self.cfg['zombie_gone_delay']:
+                    del self.zmap[wid]
+                    self.zgone.pop(wid, None)
+                    self.zfix += 1
+            elif fresh:
+                del self.zmap[wid]
+                self.zgone.pop(wid, None)
+        if not fresh:
+            return                                               # no fresh host data: change nothing (no mass removal on packet loss)
+        for wid, a in list(self.zmap.items()):                   # the host's zombie is gone / changed its kind
+            h, z = host.get(wid), mine.get(a)
+            if z is not None and (h is None or (wid not in self.zfallback and z['sig'] != h['sig'])):
+                self.kill_zombie(a)
+                del self.zmap[wid]
+                self.zfix += 1
+        mapped = set(self.zmap.values())
+        # 2) an outstanding creation batch: which of the new zombies is the one the host has (right variant)?
+        if self.zbatch:
+            since, before, wanted = self.zbatch
+            cands = [a for a in mine if a not in before and a not in mapped]
+            if (len(cands) >= len(wanted) and now - since >= 0.03) or now - since > 0.3:
+                for wid in wanted:
+                    h = host.get(wid)
+                    if h is None:
+                        continue
+                    hit = next((c for c in cands if mine[c]['sig'] == h['sig'] and mine[c]['row'] == h['row']), None)
+                    if hit is not None:
+                        self.zmap[wid] = hit
+                        cands.remove(hit)
+                        self.ztries.pop(wid, None)
+                        continue
+                    self.ztries[wid] = self.ztries.get(wid, 0) + 1
+                    if self.ztries[wid] >= self.cfg['zombie_create_tries'] or h['sig'] in self.zunsup:
+                        fb = next((c for c in cands if mine[c]['row'] == h['row']), None)
+                        if fb is not None:                       # this game cannot make that variant: show a plain zombie of the host's row
+                            self.zmap[wid] = fb
+                            self.zfallback.add(wid)
+                            cands.remove(fb)
+                            if h['sig'] not in self.zunsup:
+                                self.zunsup.add(h['sig'])
+                                self.log('[coop] this game cannot make zombie %r (mod missing / other mod): a plain zombie is shown instead' % (h['sig'],))
+                for c in cands:                                  # extras of the creation (teams, wrong variants): not the host's
+                    self.kill_zombie(c)
+                self.zbatch = None
+                mapped = set(self.zmap.values())
+        # 3) start a creation batch for host zombies that have no counterpart yet
+        if self.zbatch is None:
+            want = [w for w, h in host.items() if w not in self.zmap and 0 <= h['row'] < 8][:max(1, self.cfg['zombie_create_burst'])]
+            if want:
+                self.zbatch = (now, set(mine), want)
+                for w in want:
+                    h = host[w]
+                    self.queue_in((A_ADD_ZOMBIE, 0, h['row'], 0, self.zombie_base_type(h['sig']), 0, 0, 0))
+        # 4) every mapped zombie gets the host's numbers
+        for wid, a in self.zmap.items():
+            z, h = mine.get(a), host.get(wid)
+            if z and h:
+                self.apply_zombie(a, z['raw'], h['raw'], wid not in self.zfallback)
+        # 5) zombies my own game made that the host does not have
+        grace = self.cfg['zombie_orphan_grace']
+        mapped = set(self.zmap.values())
+        pending = set(mine) - self.zbatch[1] if self.zbatch else set()
+        for a in list(self.zseen):
+            if a not in mine or a in mapped:
+                del self.zseen[a]
+        for a in mine:
+            if a not in mapped and a not in pending:
+                if now - self.zseen.setdefault(a, now) > grace:
+                    self.kill_zombie(a)
+                    del self.zseen[a]
+        # 6) compare both sides now and then
+        if len(mapped & set(mine)) != len(host):
+            if self.zdiff_since is None:
+                self.zdiff_since = now
+            elif now - self.zdiff_since > 3.0 and now - self._zdiff_log > 5.0:
+                self._zdiff_log = now
+                self.log('[coop] zombies differ for %.0f s: host %d, here %d (fixes so far: %d)' % (now - self.zdiff_since, len(host), len(mapped & set(mine)), self.zfix))
+        else:
+            self.zdiff_since = None
 
     def remote_lose(self):
         if not (self.sy('death') and self.same_level()) or self.local['scene'] != SC_PLAYING:
@@ -976,13 +1302,9 @@ class Coop:
         if ov.get('enabled') and self.sy('cursor') and self.connected() and pc and now - pc[6] < 1.5 \
                 and self.peer and self.peer['inboard'] and self.local['inboard']:
             cur = (pc[0], pc[1], self.cursor_label(pc))
-            if pc[2] >= 0 and pc[5] >= 0:                               # the friend holds a plant taken from slot pc[5]
-                r = self.slot_rect(self.cur_board, pc[5])
-                if r:
-                    rects.append(r + (self.peer_name if ov.get('show_name', True) else '',))
         self.toasts = [t for t in self.toasts if t[1] > now]
         try:
-            self.overlay.set(cur, self.banner, rects, [t[0] for t in self.toasts], self.own_mouse)
+            self.overlay.set(cur, self.banner, rects, [t[0] for t in self.toasts] if ov.get('toasts') else [], self.own_mouse)
         except TypeError:                                              # an overlay that only knows (cursor, banner)
             self.overlay.set(cur, self.banner)
 
@@ -1012,9 +1334,23 @@ class Coop:
                     self.link.send(K_LOSE)
             self.prev_scene = sc
 
+    def mark_done(self, now, why):
+        """my level is completed (the reward dropped)"""
+        if self.done_local:
+            return
+        self.done_local = True
+        self.send_state(force=True)
+        self.log('[coop] level completed (%s)' % why)
+        rl = self.cfg['reward_lock']
+        if self.sy('victory') and self.same_level() and not rl:
+            self.link.send(K_WIN)
+        elif self.cfg['wait_for_partner_finish'] and self.role == MODE_CLIENT and self.peer and self.peer['inboard'] \
+                and not self.peer['done'] and not (rl and self.same_level()):
+            self.want_wait = True
+
     def poll_award(self, now):
         """did the level just get completed? (HasLevelAwardDropped, asked from the game)"""
-        if not self.connected() or self.local['scene'] != SC_PLAYING or self.done_local and not self.q:
+        if not self.connected() or self.local['scene'] != SC_PLAYING or (self.done_local and not self.q):
             return
         if not (self.sy('victory') or self.cfg['wait_for_partner_finish'] or self.cfg['reward_lock']):
             return
@@ -1028,16 +1364,103 @@ class Coop:
         self._award_t = now
         if r == 0:
             self.award_seen0 = True
-        elif self.award_seen0 and not self.done_local:
-            self.done_local = True
-            self.send_state(force=True)
-            self.log('[coop] level completed')
-            rl = self.cfg['reward_lock']
-            if self.sy('victory') and self.same_level() and not rl:
-                self.link.send(K_WIN)
-            elif self.cfg['wait_for_partner_finish'] and self.role == MODE_CLIENT and self.peer and self.peer['inboard'] \
-                    and not self.peer['done'] and not (rl and self.same_level()):
-                self.want_wait = True
+            if self.done_local and not self.hidden:             # flag fell back to 0 while I was "done": that was an old level
+                self.dbg('award flag fell back: new level')
+                self.new_level(now, self.cur_board)
+        elif self.award_seen0:
+            self.mark_done(now, 'award flag')
+
+    def read_award_coins(self, b):
+        """items that are level rewards (types in award_coin_types) of this board, collected or not"""
+        arr, mx = self.mem.u32(b + B_COINS), self.mem.u32(b + B_COINS_MAX)
+        if not arr or mx == 0 or mx > 4096:
+            return []
+        raw = self.mem.read(arr, mx * C_SIZE)
+        types = set(self.cfg['award_coin_types'])
+        res = []
+        for i in range(mx):
+            o = i * C_SIZE
+            if struct.unpack_from('<I', raw, o + 4)[0] != b:
+                continue
+            t = struct.unpack_from('<i', raw, o + C_TYPE)[0]
+            if t not in types:
+                continue
+            res.append(dict(addr=arr + o, type=t, collected=bool(raw[o + C_COLLECTED]), dead=bool(raw[o + C_DEAD1] or raw[o + C_DEAD2]),
+                            x=struct.unpack_from('<f', raw, o + C_X)[0], y=struct.unpack_from('<f', raw, o + C_Y)[0],
+                            card=struct.unpack_from('<i', raw, o + C_CARD)[0]))
+        return res
+
+    def poll_award_coins(self, now, b):
+        """level reward items: completion detection, mirroring to the client, 'one picks it up -> everybody does'"""
+        if not self.connected() or self.local['scene'] != SC_PLAYING:
+            return
+        if self.coin_pending:                                    # the client asked the game for a copy of the host's reward
+            typ, card, t0 = self.coin_pending
+            r = self.rd('CRES')
+            if r:
+                if typ == 16 and 0 <= card < 49:
+                    self.mem.w32(r + C_CARD, card)
+                self.coin_pending = None
+            elif now - t0 > 1.5:
+                self.coin_pending = None
+        if not (self.sy('victory') or self.cfg['wait_for_partner_finish'] or self.cfg['reward_lock'] or self.sy('reward_mirror')):
+            return
+        if now - self._coin_t < (0.08 if self.award_known else 0.2) or now - self.board_since < self.cfg['ready_delay']:
+            return
+        self._coin_t = now
+        try:
+            coins = self.read_award_coins(b)
+        except Exception:
+            return
+        alive = {c['addr']: c for c in coins if not c['collected'] and not c['dead']}
+        if self.ignore_coins is None:                            # first look at this level: whatever lies there now is not the reward
+            self.ignore_coins = set(alive)
+            return
+        for a in list(self.award_known):
+            if a not in alive:                                   # picked up
+                del self.award_known[a]
+                self.on_award_collected(now)
+        for a, c in alive.items():
+            if a not in self.ignore_coins and a not in self.award_known:
+                self.award_known[a] = c['type']
+                self.mark_done(now, 'reward item')
+                if self.role == MODE_HOST and self.sy('reward_mirror') and self.sy('zombies') and self.same_level():
+                    self.link.send(K_AWARD, P_AWARD.pack(c['type'], int(c['x']), int(c['y']), c['card'] if c['type'] == 16 else -1, 3))
+
+    def on_award_collected(self, now):
+        if now < self.collect_echo_until:
+            return                                               # I picked it up because the friend did
+        self.log('[coop] reward picked up')
+        if self.connected() and self.same_level() and self.sy('victory'):
+            self.link.send(K_COLLECT)
+
+    def remote_award(self, typ, x, y, card, motion):
+        """client (zombie mirror): the host's reward appeared -> make the same one here"""
+        b = self.board()
+        if not (b and self.role == MODE_CLIENT and self.sy('reward_mirror') and self.sy('zombies') and self.zmirror_active()):
+            return
+        if self.award_known or self.coin_pending:
+            return
+        self.wr('CRES', 0)
+        self.coin_pending = (typ, card, time.time())
+        self.queue_in((A_ADD_COIN, 0, y, x, typ, motion, 0, 0))
+
+    def remote_collect(self):
+        """the friend picked up his reward -> mine is picked up too (same effect as a click), the level ends here as well"""
+        b = self.board()
+        if not (b and self.sy('victory') and self.same_level() and self.local['scene'] == SC_PLAYING):
+            return
+        try:
+            alive = [c for c in self.read_award_coins(b) if not c['collected'] and not c['dead']]
+        except Exception:
+            return
+        self.collect_echo_until = time.time() + 2.0
+        self.log('[coop] %s picked up the reward -> yours is picked up too' % self.peer_name)
+        if alive:
+            self.unlock_coins({c['addr'] for c in alive})
+            self.queue_in((A_COLLECT, 0, 0, 0, alive[0]['addr'], 0, 0, 0))
+        elif not self.done_local:
+            self.queue_in((A_WIN, 0, 0, 0, 0, 0, 0, 0))
 
     def update_hold(self, now, b):
         """level start: the first wave (and the falling suns) wait until both players are playing"""
@@ -1098,29 +1521,48 @@ class Coop:
             res.append((arr + o, struct.unpack_from('<i', raw, o + C_TYPE)[0], raw[o + C_X:o + C_X + 8 + 0]))
         return res
 
+    def lock_coin(self, a):
+        mode = self.cfg['reward_lock_mode']
+        if a not in self.hidden:
+            self.hidden[a] = (mode, self.mem.read(a + (C_W if mode == 'hitbox' else C_X), 8))
+        if self.hidden[a][0] == 'hitbox':
+            self.mem.write(a + C_W, bytes(8))                    # no hit area: the reward stays where it is, visible, but the mouse misses it
+        else:
+            self.mem.write(a + C_X, OFFSCREEN)
+
+    def unlock_coins(self, coins):
+        for a, (mode, saved) in list(self.hidden.items()):
+            if a in coins:
+                self.mem.write(a + (C_W if mode == 'hitbox' else C_X), saved)
+            del self.hidden[a]
+
     def poll_reward_lock(self, now, b):
         p = self.peer
         lock = bool(self.cfg['reward_lock'] and self.connected() and self.same_level() and self.done_local and p
-                    and not p['done'] and self.local['scene'] == SC_PLAYING)
+                    and not p['done'] and self.local['scene'] == SC_PLAYING and not self.lock_given_up)
+        if lock:
+            if self.lock_since is None:
+                self.lock_since = now
+            mx = self.cfg['reward_wait_max']
+            if mx and now - self.lock_since > mx:
+                self.lock_given_up = True
+                lock = False
+                self.log('[coop] the reward was locked for %d s - unlocking' % mx)
+        else:
+            self.lock_since = None
         if not lock and not self.hidden:
             return
-        types = set(self.cfg['award_coin_types'])
         try:
-            coins = {a: (t, pos) for a, t, pos in self.read_coins(b)}
+            coins = {c['addr']: c for c in self.read_award_coins(b) if not c['collected'] and not c['dead']}
         except Exception:
             return
         if lock:
-            for a, (t, pos) in coins.items():
-                if t in types:
-                    if a not in self.hidden:
-                        self.hidden[a] = self.mem.read(a + C_X, 8)
-                    self.mem.write(a + C_X, OFFSCREEN)
+            for a in coins:
+                if a not in (self.ignore_coins or ()):
+                    self.lock_coin(a)
             self.banner = 'Waiting for %s to finish the level - the reward unlocks then' % self.peer_name
         else:
-            for a, pos in list(self.hidden.items()):
-                if a in coins:
-                    self.mem.write(a + C_X, pos)
-                del self.hidden[a]
+            self.unlock_coins(coins)
             self.log('[coop] reward unlocked')
             self.add_toast('Reward unlocked - take it!')
 
@@ -1243,23 +1685,29 @@ class Coop:
         if self.role != MODE_CLIENT or self.cfg['seed_choice'] == 'off':
             return
         done, n = payload[0], payload[1]
+        if self.close_sent_t is not None and time.time() - self.close_sent_t < 10.0:
+            return                                                      # already closing: late copies of the host's message are ignored
         self.host_bank = frozenset(payload[2:2 + n])
         if done:
             self.host_seed_done = True
             self.host_done_t = time.time()
 
     def remote_seed_req(self, t, want):
-        """host, seed_choice=both: apply what the client clicked"""
-        if self.role != MODE_HOST or self.cfg['seed_choice'] != 'both' or not self.chooser_open or not self.same_level():
+        """host: the client asks for my seeds (he joined while I am choosing or already playing). Answered, never repeated by me."""
+        if self.role != MODE_HOST or t != 255 or not self.same_level() or self.cfg['seed_choice'] != 'host':
             return
-        info = self.read_chooser()
-        if info is None or not 0 <= t < N_SEEDS:
+        b = self.board()
+        if not b:
             return
-        _, bank, states = info
-        if want and states[t] == 3 and len(bank) < (self.seed_capacity() or 0):
-            self.queue_in((A_SEED_PICK, 0, 0, 0, t, 0, 0, 0))
-        elif not want and states[t] == 1:
-            self.queue_in((A_SEED_UNPICK, 0, 0, 0, t, 0, 0, 0))
+        if self.chooser_open and self.local['scene'] == SC_INTRO:       # still choosing: current picks, not final
+            bank = sorted(self.seed_last_bank)
+            self.link.send(K_SEEDS, bytes([0, len(bank)]) + bytes(bank))
+        elif self.local['scene'] == SC_PLAYING:                          # already playing: my slots are the final picks
+            _, slots = self.read_slots(b)
+            bank = sorted({tp for tp, _, _ in slots if 0 <= tp < N_SEEDS})
+            if bank:
+                self.link.send(K_SEEDS, bytes([1, len(bank)]) + bytes(bank))
+                self.dbg('seed request answered: my slots %r' % bank)
 
     def poll_seeds(self, now):
         mode = self.cfg['seed_choice']
@@ -1274,18 +1722,17 @@ class Coop:
             self.dbg('seed chooser opened')
         if info is None:
             if was_open and self.role == MODE_HOST and self.same_level():
-                self.link.send(K_SEEDS, bytes([1, len(self.seed_last_bank)]) + bytes(sorted(self.seed_last_bank)))
-                self.dbg('seed chooser closed on the host: START sent')
-            elif self.role == MODE_HOST and self.same_level() and self.local['scene'] == SC_PLAYING and self.peer \
-                    and self.peer['scene'] == SC_INTRO and now - self.late_t > 1.0:
-                # the friend joined late: he is still choosing seeds while I already play -> tell him my slots, he starts with them
-                self.late_t = now
-                b = self.board()
-                _, slots = self.read_slots(b) if b else (None, [])
-                bank_types = sorted({t for t, _, _ in slots if 0 <= t < N_SEEDS})
-                if bank_types:
-                    self.link.send(K_SEEDS, bytes([1, len(bank_types)]) + bytes(bank_types))
-                    self.dbg('late join: sent my slots %r' % bank_types)
+                final = sorted(self.seed_last_bank)
+                try:
+                    b = self.board()
+                    _, slots = self.read_slots(b) if b else (None, [])
+                    real = sorted({tp for tp, _, _ in slots if 0 <= tp < N_SEEDS})
+                    if real:
+                        final = real                              # what the game really put into the host's slots
+                except Exception:
+                    pass
+                self.link.send(K_SEEDS, bytes([1, len(final)]) + bytes(final))
+                self.dbg('seed chooser closed on the host: START sent with slots %r' % final)
             return
         ch, bank, states = info
         if not self.same_level():
@@ -1299,6 +1746,15 @@ class Coop:
                 self.link.send(K_SEEDS, bytes([0, len(bank)]) + bytes(sorted(bank)))
             return
         # ---- client
+        if self.close_sent_t is not None:
+            if now - self.close_sent_t < 10.0:
+                return                                                  # the level start is under way: touch NOTHING any more
+            self.close_sent_t = None                                    # still here after 10 s: the first close did not work, one retry
+            self.close_tries += 1
+            self.host_seed_done = self.close_tries <= 1
+        if not self.host_seed_done and self.peer and self.peer['scene'] == SC_PLAYING and now - self.seed_req_t > 1.5:
+            self.seed_req_t = now                                       # joined late: ask the host for his seeds (answered once per request)
+            self.link.send(K_SEEDREQ, P_SEEDREQ.pack(255, 0))
         if self.seed_prev is None:
             self.seed_prev = bank
         else:
@@ -1330,9 +1786,10 @@ class Coop:
                             self.seed_expect[t] = (False, now)
                             self.queue_in((A_SEED_UNPICK, 0, 0, 0, t, 0, 0, 0)); self.seed_next = now + 0.12
                             break
-        if self.host_seed_done and (bank == self.host_bank or now - self.host_done_t > 2.5):
+        if self.host_seed_done and (bank == self.host_bank or now - self.host_done_t > 0.25):
             self.host_seed_done = False
-            self.dbg('host started: closing my seed chooser')
+            self.close_sent_t = now                                     # ONCE: a second close restarts the level intro -> endless loop
+            self.dbg('host started: closing my seed chooser (once)')
             self.queue_in((A_SEED_CLOSE, 0, 0, 0, 0, 0, 0, 0))
 
     def lock_start_button(self, ch):
@@ -1370,12 +1827,16 @@ class Coop:
                           interval=itv if 0 < itv < 1000 else 10)
 
     def new_level(self, now, b):
+        keep = (self.close_sent_t, self.close_tries)               # a level start in progress must survive scene flicker
         try:
             self.wr('HOLD', 0)                                  # ALWAYS: a stale hold would freeze the next level's first wave
         except Exception:
             pass
         self.restore_interval()
+        self.release_zhold_raw()
         self.reset_tracking()
+        if keep[0] is not None and now - keep[0] < 10.0:
+            self.close_sent_t, self.close_tries = keep
         self.cur_board = b
         self.board_since = now if b else 0.0
         self.prev_scene = None
@@ -1388,11 +1849,16 @@ class Coop:
         self.refresh_local(b)
         sc = self.local['scene']
         entering_intro = b and sc == SC_INTRO and self.prev_scene not in (None, SC_INTRO)
-        if b != self.cur_board or entering_intro:             # new level / left the level
+        tick = self.local['tick']
+        tick_back = bool(b) and self.last_tick is not None and tick < self.last_tick - 100       # same board address, but the clock restarted
+        if tick_back:
+            self.dbg('board clock went back (%r -> %r): new level' % (self.last_tick, tick))
+        if b != self.cur_board or entering_intro or tick_back:             # new level / left the level
             self.new_level(now, b)
             self.send_state(force=True)
             self.update_overlay(now)
             return
+        self.last_tick = tick
         if self.connected():
             self.send_state()
             rising = self.same_level()
@@ -1406,6 +1872,8 @@ class Coop:
             self.poll_scene(now)
             self.poll_seeds(now)
             self.poll_award(now)
+            self.poll_award_coins(now, b)
+            self.poll_zombies(now, b)
             self.update_hold(now, b)
             self.poll_slots(now, b)
             self.poll_time(now, b)
@@ -1439,6 +1907,7 @@ class Coop:
         elif sun != self.sun_prev:
             d = sun - self.sun_prev
             self.sun_prev = sun
+            self.sun_changed_t = now
             if self.connected() and abs(d) <= self.cfg['max_sun_delta']:
                 self.link.send(K_SUN, P_INT.pack(d))
         for table in (self.expect_add, self.expect_rm):
@@ -1493,6 +1962,27 @@ class Coop:
             if self.initial_at and now >= self.initial_at and self.board():
                 self.initial_at = None
                 self.send_lawn()
+            sr = self.cfg['sun_resync']
+            if sr and self.role == MODE_HOST and now - self._sun_t >= sr and self.sun_enabled() and self.board() \
+                    and self.local['scene'] in (SC_INTRO, SC_PLAYING) and self.sun_prev is not None:
+                self._sun_t = now
+                self.link.send(K_SETSUN, P_INT.pack(self.read_sun()))      # the host's wallet is the truth
+            hr = self.cfg['hp_resync']
+            if hr and self.role == MODE_HOST and now - self._hp_t >= hr and self.sy('plant_hp') and self.plants_enabled() \
+                    and self.local['scene'] == SC_PLAYING and self.board():
+                self._hp_t = now
+                self.send_plant_hp(self.board())                           # plant health follows the host
+            zr = self.cfg['zombie_resync']
+            if zr and self.role == MODE_HOST and now - self._zsend_t >= zr and self.sy('zombies') and self.same_level() \
+                    and self.local['scene'] == SC_PLAYING and self.board():
+                self._zsend_t = now
+                try:
+                    self.send_zombies(self.board())                            # the client shows my zombies
+                    if now - self._wave_t >= 0.1 and self.sy('waves'):
+                        self._wave_t = now
+                        self.link.send(K_WAVE, self.mem.read(self.board() + B_PROGRESS, 4))
+                except Exception as e:
+                    self.dbg('send zombies: %r' % (e,))
             rs = self.cfg['lawn_resync']
             if rs and self.role == MODE_HOST and now - self._lawn_t >= rs and self.local['scene'] == SC_PLAYING and self.board():
                 self._lawn_t = now
@@ -1734,6 +2224,7 @@ def main():
         coop.disconnect()
         coop.wr('MODE', MODE_OFF)
         coop.wr('HOLD', 0)
+        coop.wr('ZHOLD', 0)
         if overlay:
             overlay.stop()
 

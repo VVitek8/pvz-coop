@@ -1,4 +1,4 @@
-# PvZ Co-op v5 — как запустить
+# PvZ Co-op v8 — как запустить
 
 ## Один раз на каждом ПК
 1. Python 3 с галочкой «Add Python to PATH». В консоли: `pip install pymem`.

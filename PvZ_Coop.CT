@@ -25,6 +25,10 @@ define(COOP_HOLD_ZCD,00700658)
 define(COOP_HOLD_SUN,0070065C)
 define(COOP_QRES,00700660)
 define(COOP_LOSTRES,00700664)
+define(COOP_ZRES,00700668)
+define(COOP_ZHOLD,0070066C)
+define(COOP_ZHOLD_VAL,00700670)
+define(COOP_CRES,00700674)
 define(COOP_IN,00700880)
 define(COOP_TITLE,00700E80)
 define(COOP_PROMPT,00700EC0)
@@ -56,6 +60,10 @@ label(ap_close)
 label(ap_q_bowl)
 label(ap_q_award)
 label(ap_q_cap)
+label(ap_zadd)
+label(ap_cadd)
+label(ap_ccollect)
+label(pump_zhold_done)
 label(ap_done)
 registersymbol(coop_pump)
 registersymbol(coop_menu_show)
@@ -87,6 +95,12 @@ mov [edi+0000559C],eax
 mov eax,[COOP_HOLD_SUN]
 mov [edi+00005538],eax
 pump_hold_done:
+// "zombie hold" (zombie mirror, client only): the next-wave countdown stays high, so this game never spawns zombies by itself
+cmp dword ptr [COOP_ZHOLD],00
+je pump_zhold_done
+mov eax,[COOP_ZHOLD_VAL]
+mov [edi+0000559C],eax
+pump_zhold_done:
 cmp dword ptr [COOP_INMENU],00
 jne pump_actions
 cmp dword ptr [COOP_MENUSHOW],01
@@ -147,6 +161,7 @@ ret
 //  02 remove plant (row,col,p1=type)        05 add plant (row,col,p1=type,p2=imitater or -1)
 //  06 zombies won (friend lost, a living zombie is passed)             07 fade out level (friend won)
 //  08 seed chooser: pick p1                 09 seed chooser: put p1 back     0A seed chooser: close (start level)
+//  0E create zombie (row, type) -&gt; COOP_ZRES   0F create item (x, y, type, motion) -&gt; COOP_CRES   10 collect item (Coin*)
 //  0B query IsWallnutBowlingLevel           0C query HasLevelAwardDropped    0D query GetNumSeedsInBank   (result -&gt; COOP_QRES)
 // Stack is restored from COOP_SAVEESP at the end, whatever the callee's calling convention does.
 coop_apply_entry:
@@ -177,6 +192,12 @@ cmp eax,0C
 je ap_q_award
 cmp eax,0D
 je ap_q_cap
+cmp eax,0E
+je ap_zadd
+cmp eax,0F
+je ap_cadd
+cmp eax,10
+je ap_ccollect
 jmp ap_done
 
 ap_add:
@@ -346,6 +367,41 @@ call 0041BEE0
 mov [COOP_QRES],eax
 jmp ap_done
 
+ap_zadd:
+// 0E create a zombie: row = [esi+08], type = [esi+10]; the new Zombie* goes to COOP_ZRES (0 = failed)
+test edi,edi
+je ap_done
+mov dword ptr [COOP_ZRES],00
+mov ebx,00000000
+push dword ptr [esi+08]
+push dword ptr [esi+10]
+mov eax,edi
+call 0040DDC0
+mov [COOP_ZRES],eax
+jmp ap_done
+
+ap_cadd:
+// 0F create an item (level reward): x = [esi+0C], y = [esi+08], type = [esi+10], motion = [esi+14]; the Coin* goes to COOP_CRES
+test edi,edi
+je ap_done
+mov dword ptr [COOP_CRES],00
+push dword ptr [esi+14]
+push dword ptr [esi+10]
+push dword ptr [esi+08]
+push dword ptr [esi+0C]
+mov ecx,edi
+call 0040CB10
+mov [COOP_CRES],eax
+jmp ap_done
+
+ap_ccollect:
+// 10 pick up an item as if it was clicked: Coin* = [esi+10] (python checked that it is a live item of this board)
+mov ecx,[esi+10]
+test ecx,ecx
+je ap_done
+call 00432060
+jmp ap_done
+
 ap_done:
 mov esp,[COOP_SAVEESP]
 popad
@@ -360,6 +416,10 @@ unregistersymbol(coop_apply_entry)
 dd 00000000
 00700650:
 dd 00000000
+dd 00000000
+0070066C:
+dd 00000000
+00700674:
 dd 00000000</AssemblerScript>
     </CheatEntry>
     <CheatEntry>

@@ -1,15 +1,25 @@
 {
-  "name": "Vitek8",
+  "name": "shckibede",
   "port": 7777,
   "notify": true,
   "allow_different_levels": false,
   "wait_for_partner_finish": true,
   "reward_lock": true,
+  "reward_lock_mode": "hitbox",
+  "reward_wait_max": 600,
   "no_pause": true,
   "seed_choice": "host",
   "lock_client_start": true,
   "start_wait_max": 180,
-  "lawn_resync": 5.0,
+  "lawn_resync": 3.0,
+  "sun_resync": 1.0,
+  "hp_resync": 0.25,
+  "zombie_resync": 0.033,
+  "zombie_orphan_grace": 0.8,
+  "zombie_gone_delay": 0.5,
+  "zombie_create_burst": 4,
+  "zombie_create_tries": 12,
+  "variant_base": {},
   "time_tolerance": 25,
   "sync": {
     "plants": true,
@@ -19,7 +29,11 @@
     "level_start": true,
     "cursor": true,
     "slots": true,
-    "time": true
+    "time": true,
+    "plant_hp": true,
+    "zombies": true,
+    "waves": true,
+    "reward_mirror": true
   },
   "overlay": {
     "enabled": true,
@@ -27,14 +41,33 @@
     "color": "#ffa500",
     "show_name": true,
     "fit": "auto",
-    "debug_self": false
+    "debug_self": false,
+    "toasts": false
   },
   "award_coin_types": [
     8,
-    16
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27
   ],
   "no_plant_sync_modes": [],
   "lawnstrings_path": "",
   "strings": {},
-  "debug": false
+  "debug": true
 }

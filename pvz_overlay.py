@@ -166,8 +166,10 @@ class Overlay:
                         px, py = mapper.map(cur[0], cur[1])
                         canvas.create_polygon(px, py, px, py + 22, px + 6, py + 17, px + 11, py + 28, px + 15, py + 26,
                                               px + 10, py + 16, px + 17, py + 16, fill=color, outline='black', width=2)
-                        if cur[2]:
-                            text(px + 22, py + 24, cur[2], color)
+                        if cur[2]:                              # the plant in the friend's hand, in a box next to his cursor
+                            wbox = 9 * len(cur[2]) + 14
+                            canvas.create_rectangle(px + 18, py + 22, px + 18 + wbox, py + 46, fill='#202020', outline=color, width=2)
+                            canvas.create_text(px + 25, py + 34, text=cur[2], anchor='w', fill='#ffffff', font=('Arial', 12, 'bold'))
                     if self.cfg.get('debug_self') and own:       # calibration check: a cross where YOUR mouse should be
                         ox, oy = mapper.map(own[0], own[1])
                         canvas.create_line(ox - 8, oy, ox + 8, oy, fill='#00ff00', width=2)

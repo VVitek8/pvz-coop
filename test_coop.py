@@ -20,12 +20,17 @@ class FakeGame(pc.Mem):
         self.hold_wait = False; self.open_dialog = False; self.enter = False
         self.bowling = 0; self.award = 0; self.cap = 6; self.has_seed = set(range(49))
         self.lost_calls = 0; self.faded = False; self.closed = False
+        self.zextra = False; self.vgate = None
+        self.close_calls = 0; self.keep_chooser = False; self.close_delay = 0.0; self.scene_at = 0.0
         self.set_sun(50); self.set_scene(3); self.set_level(0, 1)
         self.w32(self.board + pc.B_ZCD, 1800); self.w32(self.board + pc.B_SUNCD, 600)
         for i in range(pc.N_SEEDS):
             o = self.chooser + pc.CH_SEEDS + i * pc.CH_STRIDE
             self.w32(o + pc.CH_TYPE, i); self.w32(o + pc.CH_STATE, 3)
         self.w32(self.chooser + pc.CH_START_BTN, self.btn)
+        self.zom = 0x160000
+        self.w32(self.board + pc.B_ZOMBIES, self.zom); self.w32(self.board + pc.B_ZOMBIES_MAX, 16)
+        self.zserial = 100
         self.sb, self.coins = 0x140000, 0x150000
         self.w32(self.board + pc.B_SEEDBANK, self.sb); self.w32(self.sb + pc.SB_N, 6)
         for i in range(6):
@@ -48,6 +53,17 @@ class FakeGame(pc.Mem):
     def seed_state(self, i): return self.u32(self.chooser + pc.CH_SEEDS + i * pc.CH_STRIDE + pc.CH_STATE)
     def set_seed_state(self, i, s): self.w32(self.chooser + pc.CH_SEEDS + i * pc.CH_STRIDE + pc.CH_STATE, s)
     def bank(self): return sorted(i for i in range(pc.N_SEEDS) if self.seed_state(i) in (0, 1))
+    def zaddr(self, i): return self.zom + i * pc.Z_SIZE
+    def add_zombie(self, typ, row, x, hp=270, hp1=0):
+        for i in range(16):
+            o = self.zaddr(i)
+            if self.u32(o + 4) != self.board or self.b[o + pc.Z_DEAD]: break
+        self.write(o, bytes(pc.Z_SIZE)); self.w32(o + 4, self.board); self.w32(o + pc.Z_TYPE, typ); self.w32(o + pc.Z_ROW, row)
+        self.write(o + pc.Z_X, struct.pack('<ff', x, 40.0 + 100 * row)); self.w32(o + pc.Z_HP, hp); self.w32(o + pc.Z_HP1, hp1)
+        self.zserial += 1; self.w32(o + pc.Z_ID, (self.zserial << 16) | i); return o
+    def zombies(self):
+        return [self.zaddr(i) for i in range(16) if self.u32(self.zaddr(i) + 4) == self.board and not self.b[self.zaddr(i) + pc.Z_DEAD]]
+    def zinfo(self, o): return (self.i32(o + pc.Z_TYPE), self.i32(o + pc.Z_ROW), round(struct.unpack('<f', self.read(o + pc.Z_X, 4))[0]), self.i32(o + pc.Z_HP), self.i32(o + pc.Z_HP1))
     def slot_types(self): return [self.i32(self.sb + pc.SB_FIRST + i * pc.SB_STRIDE + pc.SP_TYPE) for i in range(6)]
     def set_slot_types(self, ts):
         for i, v in enumerate(ts): self.w32(self.sb + pc.SB_FIRST + i * pc.SB_STRIDE + pc.SP_TYPE, v)
@@ -57,7 +73,9 @@ class FakeGame(pc.Mem):
             o = self.coins + i * pc.C_SIZE
             if self.u32(o + 4) != self.board or self.b[o + pc.C_DEAD1]: break
         self.write(o, bytes(pc.C_SIZE)); self.w32(o + 4, self.board); self.w32(o + pc.C_TYPE, typ)
+        self.w32(o + pc.C_W, 50); self.w32(o + pc.C_W + 4, 50)
         self.write(o + pc.C_X, struct.pack('<ff', x, y)); return o
+    def coin_wh(self, o): return (self.i32(o + pc.C_W), self.i32(o + pc.C_W + 4))
     def coin_xy(self, o): return struct.unpack('<ff', self.read(o + pc.C_X, 8))
     def hold_vals(self): return self.B('HOLD'), self.u32(self.board + pc.B_ZCD)
     def add_plant(self, row, col, typ, imi=-1):
@@ -78,9 +96,11 @@ class FakeGame(pc.Mem):
     def W(self, k, v): self.w32(pc.COOP_BASE + pc.OFF[k], v)
     def pump(self, budget=8):                                 # == coop_pump + coop_apply_entry
         self.W('HEART', self.B('HEART') + 1)
+        if self.scene_at and time.time() >= self.scene_at: self.scene_at = 0.0; self.set_scene(3); self.open_chooser(False)
         if self.B('NOPAUSE'): self.b[self.board + 0x164] = 0
         if self.B('HOLD'):
             self.w32(self.board + pc.B_ZCD, self.B('HOLD_ZCD')); self.w32(self.board + pc.B_SUNCD, self.B('HOLD_SUN'))
+        if self.B('ZHOLD'): self.w32(self.board + pc.B_ZCD, self.B('ZHOLD_VAL'))
         if self.open_dialog and (not self.hold_wait or self.enter):
             self.open_dialog = False; self.enter = False
             a = self.answers.pop(0) if self.answers else 1
@@ -98,7 +118,21 @@ class FakeGame(pc.Mem):
                 if p1 in self.has_seed and self.seed_state(p1) == 3 and len(self.bank()) < 99: self.set_seed_state(p1, 1)
             elif typ == pc.A_SEED_UNPICK:
                 if self.seed_state(p1) == 1: self.set_seed_state(p1, 3)
-            elif typ == pc.A_SEED_CLOSE: self.closed = True; self.open_chooser(False); self.set_scene(3)
+            elif typ == pc.A_SEED_CLOSE:
+                if self.u32(self.app + pc.APP_CHOOSER):
+                    self.closed = True; self.close_calls += 1
+                    if not self.keep_chooser: self.open_chooser(False)
+                    if self.close_delay: self.scene_at = time.time() + self.close_delay
+                    else: self.set_scene(3)
+            elif typ == pc.A_ADD_COIN:
+                o = self.add_coin(p1, float(col), float(row)); self.W('CRES', o); self.w32(o + pc.C_CARD, 0xFFFFFFFF)
+            elif typ == pc.A_COLLECT:
+                self.b[p1 + pc.C_COLLECTED] = 1; self.collected_addr = p1
+            elif typ == pc.A_ADD_ZOMBIE:
+                zo = self.add_zombie(p1, row, 800.0, hp=270)
+                if self.vgate and self.vgate(): self.w32(zo + pc.Z_VID, 0x191)
+                self.W('ZRES', zo)
+                if self.zextra: self.add_zombie(p1, row, 790.0)         # a team spawns extra zombies on its own
             elif typ == pc.Q_BOWL: self.W('QRES', self.bowling)
             elif typ == pc.Q_AWARD: self.W('QRES', self.award)
             elif typ == pc.Q_CAP: self.W('QRES', self.cap)
@@ -189,8 +223,10 @@ hg.set_sun(350); check(run(host, cli, lambda: cg.sun() == 350), 'host spends 50 
 cg.set_sun(cg.sun() + 25); check(run(host, cli, lambda: hg.sun() == 375), 'client collects 25 -> host wallet 375')
 hg.set_sun(hg.sun() - 100); cg.set_sun(cg.sun() + 50); settle(host, cli, 0.6)
 check(hg.sun() == cg.sun() == 325, 'simultaneous spend/collect -> both 325 (%d/%d)' % (hg.sun(), cg.sun()))
-hg.set_sun(hg.sun() + 50000); settle(host, cli, 0.3); check(cg.sun() == 325, 'absurd jump is not copied')
-hg.set_sun(325); settle(host, cli, 0.2)
+hg.set_sun(hg.sun() + 50000); settle(host, cli, 0.1)
+check(run(host, cli, lambda: cg.sun() == hg.sun(), 3), "...but the host's wallet is the truth: the periodic absolute value brings the client to it")
+hg.set_sun(325); check(run(host, cli, lambda: cg.sun() == 325, 3), 'host back to 325 -> client 325')
+cg.set_sun(10); settle(host, cli, 1.4); check(cg.sun() == hg.sun(), 'client drift (10) is repaired by the host value within ~1 s (%d/%d)' % (cg.sun(), hg.sun()))
 
 # =========================================================== 2) no pause
 hg.w32(hg.board + 0x164, 1); settle(host, cli, 0.1)
@@ -279,15 +315,16 @@ settle(host, cli, 0.6)
 # =========================================================== 8b) reward lock: nobody picks the reward until both finished
 for c in (host, cli): c.cfg['reward_lock'] = True
 hg.award = cg.award = 0; settle(host, cli, 0.6)
-hc = hg.add_coin(8, 300.0, 250.0); cc = cg.add_coin(8, 310.0, 255.0); cs = cg.add_coin(4, 50.0, 60.0)
+hc = hg.add_coin(8, 300.0, 250.0); cs = cg.add_coin(4, 50.0, 60.0)
 hg.award = 1; settle(host, cli, 0.7)
-check(hg.coin_xy(hc)[0] < -1000, 'host finished: his trophy is moved out of reach until the client finishes too')
-check(cg.coin_xy(cc)[0] == 310.0 and not cg.faded, 'the client is not locked yet and nobody is faded out (no forced victory)')
+if False: print('DEBUG done', host.done_local, cli.done_local, 'same', host.same_level(), 'peerdone', host.peer and host.peer['done'], 'ignore', host.ignore_coins, 'hidden', host.hidden, 'scene', host.local, 'given', host.lock_given_up, 'since', host.lock_since, 'coin', hg.coin_xy(hc), 'logs', host.logs[-4:])
+check(hg.coin_wh(hc) == (0, 0) and hg.coin_xy(hc)[0] > 0, 'host finished: his trophy stays where it is (visible) but has no hit area until the client finishes too')
+check(not cg.faded and not cli.done_local, 'the client has not finished and nobody is faded out (no forced victory)')
 check('Waiting for Client' in (host.banner or ''), 'banner tells why: %r' % host.banner)
 hg.add_coin(4, 70.0, 80.0)
-cg.award = 1; settle(host, cli, 0.8)
-check(hg.coin_xy(hc) == (300.0, 250.0), 'client finished -> the host trophy is back where it was')
-check(cg.coin_xy(cc) == (310.0, 255.0) and cg.coin_xy(cs) == (50.0, 60.0), "the client's own coins are untouched; suns (type 4) are never locked")
+cg.award = 1; cc = cg.add_coin(8, 310.0, 255.0); settle(host, cli, 0.8)
+check(hg.coin_xy(hc) == (300.0, 250.0) and hg.coin_wh(hc) == (50, 50), 'client finished -> the host trophy can be clicked again (hit area restored)')
+check(cg.coin_xy(cc) == (310.0, 255.0) and cg.coin_xy(cs) == (50.0, 60.0), "the client's reward is not locked (host was done first); suns (type 4) are never locked")
 check(any('unlocked' in x[0] for x in host.toasts) or True, 'unlock toast')
 hg.award = cg.award = 0; hg.b[hc + pc.C_DEAD1] = 1; cg.b[cc + pc.C_DEAD1] = 1
 for g in (hg, cg): g.set_scene(2)
@@ -325,21 +362,9 @@ cg.closed = False; cg.set_scene(3)
 for g in (hg, cg):
     for i in range(49): g.set_seed_state(i, 3)
 
-# =========================================================== 11) seed chooser, seed_choice=both
-for c in (host, cli): c.cfg['seed_choice'] = 'both'
-hg.set_scene(2); cg.set_scene(2); hg.open_chooser(); cg.open_chooser(); settle(host, cli, 0.5)
-cg.set_seed_state(7, 1)
-ok_ = run(host, cli, lambda: hg.bank() == [7] and cg.bank() == [7], 3)
-if not ok_: print('DEBUG banks', hg.bank(), cg.bank(), 'cap', host.seed_cap, cli.seed_cap, 'open', host.chooser_open, cli.chooser_open, 'hostbank', cli.host_bank, 'q', host.q, cli.q, 'same', host.same_level(), cli.same_level(), 'scenes', hg.scene_(), cg.scene_(), host.logs[-3:], cli.logs[-3:])
-check(ok_, 'seed_choice=both: client picks seed 7 -> host gets it, both banks equal')
-hg.set_seed_state(3, 1)
-check(run(host, cli, lambda: cg.bank() == [3, 7] and hg.bank() == [3, 7], 3), 'host picks seed 3 -> client gets it')
-cg.set_seed_state(7, 3)
-check(run(host, cli, lambda: hg.bank() == [3] and cg.bank() == [3], 3), 'client puts seed 7 back -> host puts it back too')
-hg.open_chooser(False); cg.open_chooser(False); hg.set_scene(3); cg.set_scene(3); settle(host, cli, 0.4)
-for g in (hg, cg):
-    for i in range(49): g.set_seed_state(i, 3)
-for c in (host, cli): c.cfg['seed_choice'] = 'host'
+# =========================================================== 11) 'both' no longer exists: the host always decides
+xx = pc.Coop(FakeGame(), {'seed_choice': 'both'}, log=lambda m: None)
+check(xx.cfg['seed_choice'] == 'host', 'seed_choice=both is turned into host (everybody follows the host)')
 
 # =========================================================== 12) friend's mouse + plant in hand
 cg.w32(cg.wm + pc.WM_MOUSE_X, 400); cg.w32(cg.wm + pc.WM_MOUSE_Y, 300)
@@ -368,13 +393,15 @@ x = pc.Coop(FakeGame(), {'strings': {'OK': '[DIALOG_BUTTON_OK]', 'HOST': 'Host [
 check(x.S('OK') == '[DIALOG_BUTTON_OK]' and x._text('[DIALOG_BUTTON_OK]', 32, True).startswith(b'[DIALOG_BUTTON_OK]'), 'strings: a real LawnStrings key is passed to the game untouched on buttons')
 check(x._text('Host [game]', 32, True).startswith(b'Host (game)'), 'strings: other square brackets are neutralised')
 
-# =========================================================== 12b) friend's slot is highlighted + "took" message
+# =========================================================== 12b) the cursor shows the plant in hand (no slot rectangle, no toast by default)
 cg.w32(cg.cur + pc.CUR_TYPE, 1); cg.w32(cg.cur + pc.CUR_SEED, 2); cg.w32(cg.cur + pc.CUR_SLOT, 2)
-check(run(host, cli, lambda: host.overlay.rects, 2), 'friend took a slot: its rectangle is sent to the overlay')
-x0 = 100 + 60 * 2
-check(host.overlay.rects[0][:4] == (x0, 8, 50, 70) and host.overlay.rects[0][4] == 'Client', 'rectangle = slot 2 of MY seed bank: %r' % (host.overlay.rects[0],))
-check(any('Client took Cherry Bomb' in x for x in host.overlay.toasts), 'toast "Client took Cherry Bomb": %r' % host.overlay.toasts)
-cg.w32(cg.cur + pc.CUR_TYPE, 0); settle(host, cli, 0.3); check(not host.overlay.rects, 'slot released -> rectangle gone')
+check(run(host, cli, lambda: host.overlay.cursor and host.overlay.cursor[2].endswith('Cherry Bomb'), 2), 'cursor label = the plant in his hand: %r' % (host.overlay.cursor,))
+settle(host, cli, 0.2)
+check(not host.overlay.rects and not host.overlay.toasts, 'no slot rectangle and no "took" toast (overlay.toasts is off)')
+host.cfg['overlay']['toasts'] = True; cg.w32(cg.cur + pc.CUR_SEED, 0); settle(host, cli, 0.3)
+check(any('Client took Peashooter' in x for x in host.overlay.toasts), 'overlay.toasts=true: "Client took Peashooter"')
+host.cfg['overlay']['toasts'] = False
+cg.w32(cg.cur + pc.CUR_TYPE, 0); settle(host, cli, 0.3)
 
 # =========================================================== 12c) a stale HOLD must never survive a level change (zombies did not come on the next level)
 hg.set_scene(2); settle(host, cli, 0.6)
@@ -421,6 +448,162 @@ cg.add_plant(0, 5, 8); settle(host, cli, 0.2)
 check((0, 5, 8) in hg.keys_of(), 'a fresh client plant is NOT removed by the re-sync (host learns about it)')
 host.cfg['lawn_resync'] = 5.0
 
+# =========================================================== 12g) the reward lock keeps working on level after level (it used to work only once)
+def new_level_pair():
+    hg.award = cg.award = 0
+    for g in (hg, cg): g.set_scene(2)
+    settle(host, cli, 0.4)
+    for g in (hg, cg): g.set_scene(3)
+    settle(host, cli, 0.7)
+for rnd in (1, 2, 3):
+    new_level_pair()
+    hg.award = 1                                   # the "award dropped" flag is stuck at 1 from the start (unreliable) ...
+    hc2 = hg.add_coin(16, 200.0, 150.0)            # ... the reward item on the lawn is what counts
+    settle(host, cli, 0.7)
+    check(hg.coin_wh(hc2) == (0, 0) and hg.coin_xy(hc2)[0] > 0, 'level %d: host reward locked until the client finishes' % rnd)
+    cc2 = cg.add_coin(8, 220.0, 170.0); cg.award = 1; settle(host, cli, 0.8)
+    check(hg.coin_wh(hc2) == (50, 50), 'level %d: client finished -> host reward unlocked, host and client both done' % rnd)
+    hg.b[hc2 + pc.C_DEAD1] = 1; cg.b[cc2 + pc.C_DEAD1] = 1
+
+# =========================================================== 12h) a new level on the SAME board address is noticed by the board clock
+hg.award = 0; cg.award = 0; hg.w32(hg.board + pc.B_TICK, 500); settle(host, cli, 0.4)
+hg.add_coin(8, 10.0, 10.0); settle(host, cli, 0.5)
+check(host.done_local, 'host is "done" (reward item on the lawn)')
+hg.b[hg.coins + 0 * pc.C_SIZE + pc.C_DEAD1] = 1
+for i in range(8): hg.b[hg.coins + i * pc.C_SIZE + pc.C_DEAD1] = 1
+hg.w32(hg.board + pc.B_TICK, 5); settle(host, cli, 0.4)
+check(not host.done_local, 'board clock went back with the same board address -> treated as a new level, "done" is reset')
+hg.w32(hg.board + pc.B_TICK, 1000); cg.award = 0; hg.award = 0; settle(host, cli, 0.4)
+
+# =========================================================== 12i) plant health follows the host
+ph = hg.add_plant(4, 4, 3); hg.w32(ph + pc.P_HP, 300)
+check(run(host, cli, lambda: (4, 4, 3) in cg.keys_of(), 3), 'plant arrived on the client')
+pcx = [o for o in cg.alive() if (cg.i32(o + 0x1C), cg.i32(o + 0x28), cg.i32(o + 0x24)) == (4, 4, 3)][0]
+cg.w32(pcx + pc.P_HP, 100)
+check(run(host, cli, lambda: cg.i32(pcx + pc.P_HP) == 300, 3), "client plant health is set to the host's (100 -> 300)")
+hg.w32(ph + pc.P_HP, 120)
+check(run(host, cli, lambda: cg.i32(pcx + pc.P_HP) == 120, 3), 'host plant gets bitten (300 -> 120): the client plant follows within ~0.25 s')
+host.cfg['sync']['plant_hp'] = cli.cfg['sync']['plant_hp'] = False; hg.w32(ph + pc.P_HP, 50); settle(host, cli, 0.6)
+check(cg.i32(pcx + pc.P_HP) == 120, 'sync.plant_hp=false: left alone'); host.cfg['sync']['plant_hp'] = cli.cfg['sync']['plant_hp'] = True
+hg.kill_key(4, 4, 3); settle(host, cli, 0.4)
+
+# =========================================================== 12j) the lock cannot last forever (reward_wait_max)
+for c in (host, cli): c.cfg['reward_wait_max'] = 0.6
+new_level_pair()
+hc3 = hg.add_coin(8, 120.0, 130.0); hg.award = 1; settle(host, cli, 0.4)
+check(hg.coin_wh(hc3) == (0, 0) and hg.coin_xy(hc3)[0] > 0, 'locked while the client has not finished')
+settle(host, cli, 0.9)
+check(hg.coin_wh(hc3) == (50, 50) and any('unlocking' in l for l in host.logs), 'reward_wait_max: unlocked after the timeout')
+for c in (host, cli): c.cfg['reward_wait_max'] = 600
+hg.b[hc3 + pc.C_DEAD1] = 1; new_level_pair()
+
+# =========================================================== 12k) zombie mirror (host's zombies are shown on the client)
+for c in (host, cli): c.cfg['sync']['zombies'] = True; c.cfg['zombie_orphan_grace'] = 0.4
+for g in (hg, cg):
+    for o in g.zombies(): g.b[o + pc.Z_DEAD] = 1
+za = hg.add_zombie(0, 1, 640.0, hp=270); zb = hg.add_zombie(2, 3, 500.0, hp=200, hp1=640)
+check(run(host, cli, lambda: len(cg.zombies()) == 2, 4), 'client shows the 2 zombies of the host')
+check(run(host, cli, lambda: sorted(cg.zinfo(o) for o in cg.zombies()) == sorted(hg.zinfo(o) for o in hg.zombies()), 3), 'same type, row, position, body health and armor health: %r' % sorted(cg.zinfo(o) for o in cg.zombies()))
+check(cg.B('ZHOLD') == 1, "the client's own waves are held off (no zombies of its own)")
+settle(host, cli, 1.0); check(len(cg.zombies()) == 2, 'no duplicates after a while (%d)' % len(cg.zombies()))
+hg.write(za + pc.Z_X, struct.pack('<f', 420.0)); hg.w32(za + pc.Z_HP, 90); hg.w32(zb + pc.Z_HP1, 0)
+check(run(host, cli, lambda: sorted(cg.zinfo(o) for o in cg.zombies()) == sorted(hg.zinfo(o) for o in hg.zombies()), 3), 'host zombie walked and was shot (x 640 -> 420, hp 270 -> 90, armor broken): the client follows')
+hg.b[za + pc.Z_DEAD] = 1
+check(run(host, cli, lambda: len(cg.zombies()) == 1, 3), 'host zombie died -> it disappears on the client')
+cg.add_zombie(4, 2, 300.0)
+check(run(host, cli, lambda: len(cg.zombies()) == 1, 3), "a zombie only the client has (made by its own logic) is removed after a moment")
+hg.add_zombie(7, 0, 700.0); cg.zextra = True
+check(run(host, cli, lambda: len(cg.zombies()) == 2 and any(cg.zinfo(o)[0] == 7 for o in cg.zombies()), 4), 'a zombie that brings extra zombies when created: the extras are removed, only the host\'s zombies stay')
+settle(host, cli, 1.0); check(len(cg.zombies()) == 2, 'still exactly the host\'s 2 zombies (%d)' % len(cg.zombies())); cg.zextra = False
+hg.set_scene(5)
+check(run(host, cli, lambda: cg.faded, 3), 'host reached the award screen -> the client level ends too')
+cg.faded = False; hg.set_scene(3)
+cg.set_board_ptr(0); settle(host, cli, 0.4)
+check(cg.B('ZHOLD') == 0, 'level left: the zombie hold is cleared in the game')
+cg.set_board_ptr(cg.board)
+for c in (host, cli): c.cfg['sync']['zombies'] = False
+settle(host, cli, 0.5)
+for g in (hg, cg):
+    for o in g.zombies(): g.b[o + pc.Z_DEAD] = 1
+cg.add_zombie(1, 1, 300.0); settle(host, cli, 1.0)
+check(len(cg.zombies()) == 1 and cg.B('ZHOLD') == 0, 'sync.zombies=false (default): everybody keeps their own zombies, nothing is held')
+
+# =========================================================== 12l) zombie mirror, part 2: variants (mods), everything copied, rate, no flicker
+import itertools
+for c in (host, cli): c.cfg['sync']['zombies'] = True; c.cfg['zombie_orphan_grace'] = 0.4; c.cfg['zombie_create_tries'] = 6
+for g in (hg, cg):
+    for o in g.zombies(): g.b[o + pc.Z_DEAD] = 1
+cnt = {'n': 0}; orig_rz = cli.remote_zombies
+def counting(payload, _o=orig_rz): cnt['n'] += 1; return _o(payload)
+cli.remote_zombies = counting
+seq = itertools.cycle([0, 1, 0, 0, 1, 1, 0, 1, 0, 0, 0, 1])
+cg.vgate = lambda: next(seq)                       # a mod that makes a variant by chance when a zombie is created
+v1 = hg.add_zombie(0, 1, 640.0, hp=500); hg.w32(v1 + pc.Z_VID, 0x191)           # host: fire-breather variant (id 0x191 in +134)
+v2 = hg.add_zombie(0, 2, 600.0, hp=270); v3 = hg.add_zombie(2, 3, 560.0, hp=200, hp1=640)
+def sigs(g): return sorted((g.i32(o + pc.Z_TYPE), g.u32(o + pc.Z_VID), g.i32(o + pc.Z_ROW)) for o in g.zombies())
+check(run(host, cli, lambda: sigs(cg) == sigs(hg), 5), 'mod variants: the client shows exactly the host\'s variants (same type + variant id), creation retried until the random choice matches: %r' % sigs(cg))
+settle(host, cli, 0.8); check(len(cg.zombies()) == 3 and sigs(cg) == sigs(hg), 'no extra / wrong variants left over (%d zombies)' % len(cg.zombies()))
+hg.w32(v2 + 0x28, 7); hg.w32(v2 + 0x68, 123); hg.write(v2 + 0x124, struct.pack('<f', 0.5)); hg.w32(v2 + 0x118, 4444); hg.w32(v2 + 0x110, 5555)
+cz = [o for o in cg.zombies() if cg.i32(o + pc.Z_ROW) == 2][0]; cg.w32(cz + 0x118, 9); cg.w32(cz + 0x110, 8)
+check(run(host, cli, lambda: cg.i32(cz + 0x28) == 7 and cg.i32(cz + 0x68) == 123 and struct.unpack('<f', cg.read(cz + 0x124, 4))[0] == 0.5, 3), 'EVERYTHING numeric is copied (state, timers, speed, ...)')
+check(cg.i32(cz + 0x118) == 9 and cg.i32(cz + 0x110) == 8, 'animation / attachment ids stay local (not copied)')
+n0 = cnt['n']; run(host, cli, lambda: False, 1.0)
+check(cnt['n'] - n0 >= 18, 'the host sends its zombies ~30 times a second (%d packets in 1 s)' % (cnt['n'] - n0))
+vz = [o for o in cg.zombies() if cg.u32(o + pc.Z_VID) == 0x191][0]; cg.b[vz + pc.Z_DEAD] = 1
+run(host, cli, lambda: False, 0.2); check(len(cg.zombies()) == 2, 'a zombie that died only on the client is not brought back instantly (flicker)')
+check(run(host, cli, lambda: sigs(cg) == sigs(hg), 4), 'but it is brought back (same variant) when the host still has it: both sides equal again')
+# a client game that cannot make the variant at all (other mod / no mod)
+cg.vgate = None
+v4 = hg.add_zombie(0, 4, 500.0, hp=900); hg.w32(v4 + pc.Z_VID, 0x195)
+check(run(host, cli, lambda: any('cannot make' in l for l in cli.logs) and len(cli.zmap) == 4, 8), 'unknown variant 0x195: shown as a plain zombie of the same row after a few tries')
+settle(host, cli, 1.0)
+check(len(cg.zombies()) == 4 and any('cannot make' in l for l in cli.logs), 'no endless creating (%d zombies), the player is told once' % len(cg.zombies()))
+pz = [o for o in cg.zombies() if cg.i32(o + pc.Z_ROW) == 4][0]
+check(cg.u32(pz + pc.Z_VID) == 0 and cg.i32(pz + pc.Z_HP) == 900, 'its health etc. still follows the host while the unsupported variant id is not forced onto the client game')
+# waves: progress bar from the host
+hg.write(hg.board + pc.B_PROGRESS, struct.pack('<f', 0.625)); check(run(host, cli, lambda: struct.unpack('<f', cg.read(cg.board + pc.B_PROGRESS, 4))[0] == 0.625, 3), "level progress bar follows the host (waves are visible, taken from the host)")
+# rewards
+for g in (hg, cg):
+    for o in g.zombies(): g.b[o + pc.Z_DEAD] = 1
+for c in (host, cli): c.cfg['reward_lock'] = True
+for g in (hg, cg): g.award = 0
+for g in (hg, cg): g.set_scene(2)
+settle(host, cli, 0.4)
+for g in (hg, cg): g.set_scene(3)
+settle(host, cli, 0.8)
+hr = hg.add_coin(18, 300.0, 200.0)                    # a money bag (mini-game reward) on the host
+check(run(host, cli, lambda: any(cg.i32(o + pc.C_TYPE) == 18 for o in [cg.coins + i * pc.C_SIZE for i in range(8)] if cg.u32(o + 4) == cg.board and not cg.b[o + pc.C_DEAD1]), 3), 'the host reward appears on the client too (a copy is created)')
+cr = [o for o in [cg.coins + i * pc.C_SIZE for i in range(8)] if cg.u32(o + 4) == cg.board and cg.i32(o + pc.C_TYPE) == 18][0]
+settle(host, cli, 0.5)
+check(hg.coin_wh(hr) == (50, 50) and cg.coin_wh(cr) == (50, 50), 'both rewards exist -> both are unlocked')
+hg.b[hr + pc.C_COLLECTED] = 1                          # the host clicks his bag
+check(run(host, cli, lambda: cg.b[cr + pc.C_COLLECTED] == 1, 3), "the host picked up his bag -> the client's bag is picked up too (same code as a click: reward + level end)")
+settle(host, cli, 0.8); check(hg.b[hr + pc.C_COLLECTED] == 1 and getattr(hg, 'collected_addr', None) is None, 'no echo back to the host')
+# the host leaves the level (mini-game: straight to the menu) -> the client's level ends even though the coin logic did not fire
+for g in (hg, cg): g.b[g.coins:g.coins + 8 * pc.C_SIZE] = bytes(8 * pc.C_SIZE)
+cg.faded = False
+for g in (hg, cg): g.set_scene(2)
+settle(host, cli, 0.4)
+for g in (hg, cg): g.set_scene(3)
+settle(host, cli, 0.8)
+hg.set_board_ptr(0); hg.set_scene(1)
+check(run(host, cli, lambda: cg.faded, 3), 'the host left the level -> the client level ends too (it used to stay stuck without a way out)')
+hg.set_board_ptr(hg.board); hg.set_scene(3); cg.faded = False
+cli.remote_zombies = orig_rz
+for c in (host, cli): c.cfg['sync']['zombies'] = False
+settle(host, cli, 0.6)
+
+# =========================================================== 12m) simultaneous start: the START message carries the REAL slots
+hg.set_scene(2); cg.set_scene(2); hg.open_chooser(); cg.open_chooser(); settle(host, cli, 0.5)
+for t_ in (0, 1, 2, 3, 4, 5): hg.set_seed_state(t_, 1)
+run(host, cli, lambda: cg.bank() == [0, 1, 2, 3, 4, 5], 3)
+hg.set_slot_types([0, 1, 2, 3, 4, 5])
+for t_ in (0, 1, 2, 3, 4, 5): hg.set_seed_state(t_, 3)       # the chooser panel slides away: the picks look "gone" for a moment
+hg.open_chooser(False); hg.set_scene(3)
+t0 = time.time(); ok_ = run(host, cli, lambda: cg.close_calls >= 1, 3); dt = time.time() - t0
+check(ok_ and dt < 0.8, 'host starts -> the client starts at once (%.2f s), not after a long wait; his bank was not emptied by the shrinking chooser: %r' % (dt, cg.bank()))
+run(host, cli, lambda: False, 0.5)
+
 lsf = tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False, encoding='utf-8')
 lsf.write('[DIALOG_BUTTON_OK]\nOK\n\n[COOP_HOST]\nHost Game\n\n[OTHER]\nx\n'); lsf.close()
 check(pc.load_lawnstrings(lsf.name) == {'DIALOG_BUTTON_OK', 'COOP_HOST', 'OTHER'}, 'LawnStrings.txt parser finds the keys')
@@ -446,16 +629,36 @@ th = threading.Thread(target=lambda: run(host, cli, lambda: cli.role == 0, 2.0))
 check(len(cg.seen) == n + 1 and 'Connected to Host as CLIENT' in cg.seen[-1][1] and cli.role == 0, 'connected menu: status + Disconnect works')
 check(cg.B('HOLD') == 0 and cg.B('MODE') == 0, 'disconnect releases the hold and switches the game side off')
 for g_ in (hg, cg): pass
-# =========================================================== 15) late join: the host already plays, the friend is still in the seed chooser
+# =========================================================== 15) the friend joins while seeds are being chosen / while the host already plays: NO start loop
 for g in (hg, cg): g.keys = set()
-port = free_port()
-hg2, host2 = mk('Host', port, seed_choice='host'); cg2, cli2 = mk('Client', port, seed_choice='host')
-start_tickers(hg2, cg2)
-hg2.set_slot_types([3, 0, 5, 1, 2, 4]); cg2.set_scene(2); cg2.open_chooser()
+def join_pair(**kw):
+    port = free_port()
+    a, ha = mk('Host', port, seed_choice='host', **kw); b, cb = mk('Client', port, seed_choice='host', **kw)
+    start_tickers(a, b)
+    return a, b, ha, cb, port
+# 15a) host already plays, the client is still in his seed chooser (his chooser stays alive and the intro takes 2.5 s: the old loop case)
+hg2, cg2, host2, cli2, port = join_pair()
+hg2.set_slot_types([3, 0, 5, 1, 2, 4]); cg2.set_scene(2); cg2.open_chooser(); cg2.keep_chooser = True; cg2.close_delay = 2.5
 host2.start_host(); assert cli2.join('127.0.0.1', port)
-check(run(host2, cli2, lambda: cg2.closed, 6), 'host already plays, client still chooses: the client gets the host slots and can start (Let\'s Rock does not hang)')
-check(cg2.bank() == [0, 1, 2, 3, 4, 5] or cg2.bank() == [0, 1, 2, 3, 4, 5][:len(cg2.bank())], 'client bank = host slots: %r' % cg2.bank())
-
+check(run(host2, cli2, lambda: cg2.close_calls >= 1, 6), 'host already plays, client chooses: the client asks for the host seeds and starts')
+run(host2, cli2, lambda: False, 5.0)
+check(cg2.close_calls == 1, 'the chooser is closed exactly ONCE even though it stays alive 2.5 s (it was called every second -> endless loop): %d' % cg2.close_calls)
+check(cg2.scene_() == 3 and host2.peer['scene'] == 3, 'client reached the lawn and the host sees it (scene 3)')
+# 15b) the friend joins while the HOST is still choosing; the host starts later; duplicated "start" messages must not re-close
+hg3, cg3, host3, cli3, port3 = join_pair()
+hg3.set_scene(2); cg3.set_scene(2); hg3.open_chooser(); cg3.open_chooser(); cg3.keep_chooser = True; cg3.close_delay = 2.5
+host3.start_host(); assert cli3.join('127.0.0.1', port3)
+run(host3, cli3, lambda: host3.same_level() and cli3.same_level(), 3)
+for t_ in (0, 1, 2, 3, 4, 5): hg3.set_seed_state(t_, 1)
+check(run(host3, cli3, lambda: cg3.bank() == [0, 1, 2, 3, 4, 5], 4), 'friend joined during the host choice: his bank follows')
+hg3.open_chooser(False); hg3.set_scene(3)
+check(run(host3, cli3, lambda: cg3.close_calls >= 1, 4), 'host started -> client closes')
+for k in range(4):
+    host3.link.send(pc.K_SEEDS, bytes([1, 6, 0, 1, 2, 3, 4, 5])); run(host3, cli3, lambda: False, 0.4)   # duplicated / late START messages
+check(cg3.close_calls == 1, 'duplicate START messages are ignored: close called once (%d)' % cg3.close_calls)
+run(host3, cli3, lambda: cg3.scene_() == 3, 4)
+check(cg3.scene_() == 3, 'client is on the lawn')
+for g_ in (hg, cg): pass
 for t in tickers: t.on = False
 time.sleep(0.05)
 cg.no_dialogs = True; t0 = time.time(); r = cli.dialog('T', 'x', 'a', 'b')
